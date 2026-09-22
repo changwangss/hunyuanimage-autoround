@@ -5,7 +5,11 @@ Validated on 2026-09-22 against AutoRound commit
 
 ## Executed checks
 
-- Fourteen tests passed in `test_adapter.py`:
+- Sixteen tests passed in `test_adapter.py`:
+  - Native Hunyuan router retains FP32 routing after weight dequantization,
+    with activation QDQ still enabled.
+  - QDQ generation forwards inference settings and saves a PIL result. The
+    generator is mocked here; this is not a real image-quality test.
   - Native Tencent Euler scheduler subsets of 1, 2, 4 and all 8 steps: timestep
     membership/order, sigma alignment, MeanFlow next-time conditioning, Euler
     updates, seeded reproducibility and scheduler restoration after exceptions.
@@ -27,6 +31,13 @@ Validated on 2026-09-22 against AutoRound commit
   quantization settings, and expert weight packing dtype/shape.
   Each runs four prompts with four steps selected from an eight-step schedule,
   verifying exactly 16 cached forwards per decoder block.
+- Both exported tiny checkpoints are reloaded through the inference script's
+  Transformers/AutoRound `backend="torch"` loader. All 10 quantized linears are
+  checked for exact packed-weight/scale preservation, per-layer W8A8/W4A4
+  selection, and output agreement with independently decoded E2M1/E4M3 weights
+  and E8M0 scales plus AutoRound activation QDQ.
+  Reloaded blocks also execute three synthetic denoising steps through native
+  Hunyuan SDPA attention and its static KV cache, with finite outputs.
 - Ruff lint and formatting checks passed for the Python files.
 - The CLI help command and pinned test-source SHA256 verification passed.
 
@@ -53,6 +64,7 @@ for the full model.
   calibration, and tuning with the actual 80B checkpoint.
 - Multi-GPU full-model calibration and its peak CPU/GPU memory requirements.
 - Reloading the exported full-model checkpoint in an inference engine.
+- Complete native Hunyuan QDQ generation from the exported 80B checkpoint.
 - Generated-image quality and comparison against the original model.
 
 The tiny-model integration tests use the published Hunyuan static cache,

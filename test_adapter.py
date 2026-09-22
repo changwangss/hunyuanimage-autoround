@@ -14,6 +14,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig, PreTrainedModel
 from transformers.cache_utils import StaticCache
+from PIL import Image
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 
@@ -26,6 +27,10 @@ from quantize_hunyuan_mxfp8 import (
     parse_args,
 )
 from auto_round.utils import parse_layer_config_arg
+from auto_round.data_type.utils import get_quant_func
+from auto_round.experimental.qmodules.mx import MXFP4QuantLinear, MXFP8QuantLinear
+from auto_round.schemes import QuantizationScheme
+import infer_hunyuan_qdq as inference
 
 
 def attention_class():
@@ -63,6 +68,59 @@ def native_scheduler():
     }
     exec(compile("from __future__ import annotations\n" + ast.unparse(node), str(source), "exec"), env)
     return env["FlowMatchDiscreteScheduler"](shift=3.0, reverse=True, solver="euler")
+
+
+def test_qdq_router_preserves_native_fp32_routing():
+    source = Path(__file__).parent / "reference/modeling_hunyuan_image_3.py"
+    tree = ast.parse(source.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HunyuanTopKGate")
+    env = {"torch": torch, "nn": nn, "F": torch.nn.functional}
+    exec(compile("from __future__ import annotations\n" + ast.unparse(node), str(source), "exec"), env)
+    gate_class = env["HunyuanTopKGate"]
+    gate = gate_class.__new__(gate_class)
+    nn.Module.__init__(gate)
+    gate.moe_topk = 2
+    scheme = QuantizationScheme(
+        bits=8, act_bits=8, data_type="mx_fp", act_data_type="mx_fp", group_size=32, act_group_size=32, act_dynamic=True
+    )
+    gate.wg = MXFP8QuantLinear(64, 4, scheme, dtype=torch.float32)
+    torch.manual_seed(123)
+    gate.wg.weight.copy_(torch.randn(4, 64).to(torch.float8_e4m3fn))
+    gate.wg.weight_scale.fill_(124)
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.mlp = nn.Module()
+    model.model.mlp.gate = gate
+    expected_weight = gate.wg.weight.float() * 0.125
+    inference.preserve_router_precision(model)
+    assert gate.wg.weight.dtype == torch.float32
+    assert not gate.wg.pre_dequantized_input
+    torch.testing.assert_close(gate.wg.weight, expected_weight)
+    x = torch.randn(1, 5, 64, dtype=torch.bfloat16)
+    qdq, _ = get_quant_func(dtype="mx_fp", bits=8, sym=True)
+    qx = qdq(tensor=x.float().reshape(-1, 64), bits=8, group_size=32)[0]
+    expected = gate.easy_topk(torch.nn.functional.linear(qx, expected_weight), 2)
+    actual = gate(x, topk_impl="easy")
+    torch.testing.assert_close(actual, expected)
+
+
+def test_qdq_generation_uses_full_inference_steps(monkeypatch, tmp_path):
+    model = TinyModel(make_config())
+    image = Image.new("RGB", (8, 8), "green")
+    generate = Mock(return_value=(None, [image]))
+    monkeypatch.setattr(model, "generate_image", generate)
+    original_update = HunyuanStaticCache.update
+    result = inference.generate_image(model, "a tree", num_inference_steps=8, guidance_scale=5.0, seed=7)
+    result.save(tmp_path / "qdq.png")
+    with Image.open(tmp_path / "qdq.png") as saved:
+        assert saved.size == (8, 8)
+    kwargs = generate.call_args.kwargs
+    assert kwargs["generation_config"].diff_infer_steps == 8
+    assert kwargs["generation_config"].diff_guidance_scale == 5.0
+    assert kwargs["seed"] == 7 and kwargs["bot_task"] == "image"
+    assert not kwargs["use_taylor_cache"]
+    assert model.generation_config.diff_guidance_scale == 2.5
+    assert HunyuanStaticCache.update is original_update
 
 
 @pytest.mark.parametrize("calib_steps", [1, 2, 4, 8])
@@ -315,6 +373,7 @@ class TinyModel(PreTrainedModel):
         self.calls = []
         self.generation_config = SimpleNamespace(diff_infer_steps=8, diff_guidance_scale=2.5)
         self.pipeline = SimpleNamespace(scheduler=native_scheduler())
+        self.post_init()
 
     def generate_image(self, **kwargs):
         self.calls.append(kwargs)
@@ -336,6 +395,7 @@ class TinyModel(PreTrainedModel):
                     use_cache=True,
                     custom_pos_emb=rotary(positions, h.dtype),
                 )[0]
+        return h
 
 
 @pytest.mark.parametrize("expert_bits", [8, 4])
@@ -393,3 +453,41 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
                     value for pattern, value in exported["extra_config"].items() if re.search(pattern, name)
                 )
                 assert settings["bits"] == settings["act_bits"] == 4
+
+    # Reload the actual export through the same Transformers/AutoRound QDQ loader.
+    # The tiny Llama config needs its custom attention settings restored explicitly.
+    config = make_config()
+    config.quantization_config = exported
+    monkeypatch.setattr(inference, "AutoModelForCausalLM", TinyModel)
+    loaded = inference.load_qdq_model(tmp_path / "export", device_map="cuda:0", config=config)
+    x = torch.randn(1, 3, 64, device="cuda:0", dtype=torch.bfloat16)
+    checked = 0
+    for name, original in model.named_modules():
+        if not hasattr(original, "weight_scale"):
+            continue
+        layer = loaded.get_submodule(name)
+        bits = original.bits
+        assert isinstance(layer, MXFP4QuantLinear if bits == 4 else MXFP8QuantLinear)
+        weight_name = "weight_packed" if bits == 4 else "weight"
+        packed = getattr(original, weight_name).to(x.device)
+        torch.testing.assert_close(getattr(layer, weight_name).float(), packed.float(), rtol=0, atol=0)
+        torch.testing.assert_close(layer.weight_scale, original.weight_scale.to(x.device), rtol=0, atol=0)
+        assert layer.config.bits == layer.config.act_bits == bits
+        if bits == 4:
+            codes = torch.stack([packed & 15, packed >> 4], dim=-1).flatten(-2).long()
+            values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=x.device)
+            weight = values[codes & 7] * torch.where(codes & 8 != 0, -1.0, 1.0)
+        else:
+            weight = packed.float()
+        scales = 2.0 ** (original.weight_scale.to(x.device).float() - 127)
+        weight = (weight.reshape(weight.shape[0], -1, 32) * scales[..., None]).reshape(weight.shape)
+        qdq, _ = get_quant_func(dtype="mx_fp", bits=bits, sym=True)
+        qx = qdq(tensor=x, bits=bits, group_size=32)[0]
+        bias = original.bias.to(x) if original.bias is not None else None
+        expected = torch.nn.functional.linear(qx, weight.to(x.dtype), bias)
+        torch.testing.assert_close(layer(x), expected, rtol=0, atol=0)
+        checked += 1
+    assert checked == 10
+    with compatible_cache_initialization(HunyuanStaticCache):
+        output = loaded.generate_image(seed=42, generation_config=SimpleNamespace(diff_infer_steps=3))
+    assert output.shape == (1, 2, 64) and torch.isfinite(output).all()

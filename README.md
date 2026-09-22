@@ -87,6 +87,41 @@ an optimized low-memory loader for an 80B model.
   Loading the exported custom architecture with a specific inference engine and
   checking generated-image quality are separate validation steps.
 
+## Generate an image with QDQ
+
+Use the exported quantized directory with the same working Hunyuan/AutoRound
+environment. The script selects AutoRound's PyTorch QDQ backend and reads each
+layer's saved quantization settings, including MXFP4 expert overrides:
+
+```bash
+python infer_hunyuan_qdq.py \
+  --model /path/to/HunyuanImage-3-Instruct-Distil-MXFP8 \
+  --prompt "A brown and white dog running on green grass, realistic photography" \
+  --output outputs/qdq_seed42.png \
+  --num_inference_steps 8 --image-size 1024x1024 \
+  --guidance-scale 5.0 --seed 42
+```
+
+This loads the saved packed weights/scales without quantizing the original model
+again. Each linear dequantizes its weights and dynamically applies activation
+QDQ before floating-point matmul. Only the small MoE router weights are
+pre-dequantized to FP32 to preserve Hunyuan's dtype-dependent router behavior;
+their activation QDQ remains enabled. Other weights stay packed between calls.
+No vLLM-Omni or low-bit GEMM backend is used.
+
+`--num_inference_steps` is the actual full generation length here; calibration
+sampling is not applied. The script saves the image and a JSON sidecar with the
+prompt, model path, seed and generation settings. Compare with the original model
+using the same prompt, seed, image size, guidance and inference steps, direct
+`bot_task="image"`, `use_system_prompt="en_unified"`, and Taylor cache disabled.
+Use `--seed 43` and a different output name to inspect more samples.
+
+All packed weights must fit on the visible GPUs, with additional memory for
+temporary dequantized weights and activations. `--max-memory` accepts the same
+GPU budgets as quantization. This is a quality-checking path and can be slow;
+it does not measure production low-bit inference speed. Full 80B generation has
+not been validated locally.
+
 ## Why there is an adapter
 
 AutoRound currently classifies this checkpoint as MLLM. A small DiffusionPipeline
