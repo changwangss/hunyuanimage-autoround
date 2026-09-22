@@ -12,6 +12,7 @@ import shutil
 import sys
 from collections import Counter
 from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 from types import MethodType
 from unittest.mock import patch
@@ -163,6 +164,10 @@ class HunyuanPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(self, prompt, guidance_scale=5.0, num_inference_steps=8, generator=None):
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+        # Native gen_image reads these from generation_config, not loose kwargs.
+        generation_config = deepcopy(self.transformer.generation_config)
+        generation_config.diff_infer_steps = num_inference_steps
+        generation_config.diff_guidance_scale = guidance_scale
         model_module = sys.modules[type(self.transformer).__module__]
         with compatible_cache_initialization(model_module.HunyuanStaticCache):
             for text in prompts:
@@ -172,8 +177,7 @@ class HunyuanPipeline(DiffusionPipeline):
                     image_size=self.image_size,
                     bot_task="image",
                     use_system_prompt="en_unified",
-                    diff_infer_steps=num_inference_steps,
-                    diff_guidance_scale=guidance_scale,
+                    generation_config=generation_config,
                     use_taylor_cache=False,
                     verbose=0,
                 )

@@ -5,7 +5,11 @@ Validated on 2026-09-22 against AutoRound commit
 
 ## Executed checks
 
-- Five tests passed in `test_adapter.py`:
+- Seven tests passed in `test_adapter.py`:
+  - Tencent's published image-generation dispatch receives the requested step
+    count (3 and 8) and guidance through the adapter, without changing the
+    model's default generation config. Tokenization and the image pipeline are
+    stubbed for this check.
   - Native Hunyuan static cache with the installed two-argument initializer,
     including initial and subsequent indexed KV updates and patch restoration.
   - The same native cache with a simulated legacy single-argument initializer.
@@ -49,6 +53,9 @@ synthetic denoising inputs, a small MoE-like module, and mocked COCO captions.
 The original tests used a simplified cache and missed the Transformers
 `lazy_initialization(key_states, value_states)` incompatibility. This was
 reproduced against Transformers 5.12.1 and covered by the updated tests.
+The generation-dispatch regression also reproduced the old adapter ignoring a
+requested 3-step run and using the default 8 steps. The adapter now passes an
+explicit generation config; tiny-model calibration consumes that same config.
 They do not validate the full Tencent MoE or
 native image-generation pipeline. The published attention source is pinned at
 Tencent revision `c8ffd07206f1b843697606968196e8f59f8ff38c` and verified by

@@ -5,6 +5,7 @@ import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pandas as pd
 import pytest
@@ -13,7 +14,12 @@ from torch import nn
 from transformers import LlamaConfig, PreTrainedModel
 from transformers.cache_utils import StaticCache
 
-from quantize_hunyuan_mxfp8 import build_quantizer, compatible_cache_initialization, install_replay_forward
+from quantize_hunyuan_mxfp8 import (
+    HunyuanPipeline,
+    build_quantizer,
+    compatible_cache_initialization,
+    install_replay_forward,
+)
 from auto_round.utils import parse_layer_config_arg
 
 
@@ -38,6 +44,50 @@ def native_cache_class():
 
 
 HunyuanStaticCache = native_cache_class()
+
+
+@pytest.mark.parametrize("steps", [3, 8])
+def test_adapter_passes_options_to_native_generation(monkeypatch, steps):
+    source = Path(__file__).parent / "reference/modeling_hunyuan_image_3.py"
+    tree = ast.parse(source.read_text())
+    model_class = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HunyuanImage3ForCausalMM")
+    generate = next(n for n in model_class.body if isinstance(n, ast.FunctionDef) and n.name == "generate")
+    env = {"torch": torch, "default": lambda value, fallback: fallback if value is None else value}
+    exec(compile("from __future__ import annotations\n" + ast.unparse(generate), str(source), "exec"), env)
+    model = TinyModel(make_config())
+    model.config.use_meanflow = True
+    model.config.cfg_distilled = True
+    model._tokenizer = SimpleNamespace(encode=lambda text: [9])
+    model.pipeline = Mock(return_value=[None])
+    info = SimpleNamespace(
+        image_token_length=2,
+        add_timestep_token=True,
+        add_guidance_token=True,
+        add_timestep_r_token=True,
+        image_height=1024,
+        image_width=1024,
+    )
+
+    def generate_image(**kwargs):
+        # Bypass tokenization/VAE only; use Tencent's actual generation dispatch.
+        return env["generate"](
+            model,
+            mode="gen_image",
+            tokenizer_output=SimpleNamespace(tokens=torch.tensor([[1, 9, 2]])),
+            batch_gen_image_info=[info],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(model, "generate_image", generate_image)
+    original_config = model.generation_config
+    HunyuanPipeline(model)(["a cat", "a dog"], num_inference_steps=steps, guidance_scale=5.0)
+    assert model.pipeline.call_count == 2
+    for call in model.pipeline.call_args_list:
+        assert call.kwargs["num_inference_steps"] == steps
+        assert call.kwargs["guidance_scale"] == 5.0
+    assert model.generation_config is original_config
+    assert original_config.diff_infer_steps == 8
+    assert original_config.diff_guidance_scale == 2.5
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -179,12 +229,14 @@ class TinyModel(PreTrainedModel):
         self.model.layers = nn.ModuleList([Block(config, i) for i in range(2)])
         self.model.embed_tokens = nn.Embedding(32, config.hidden_size)
         self.calls = []
+        self.generation_config = SimpleNamespace(diff_infer_steps=8, diff_guidance_scale=2.5)
 
     def generate_image(self, **kwargs):
         self.calls.append(kwargs)
         generator = torch.Generator(device=self.device).manual_seed(kwargs["seed"])
         cache = HunyuanStaticCache(config=self.config, max_cache_len=5, dynamic=False)
-        for step in range(kwargs["diff_infer_steps"]):
+        gen_config = kwargs.get("generation_config", self.generation_config)
+        for step in range(gen_config.diff_infer_steps):
             length = 5 if step == 0 else 2
             h = torch.randn(1, length, 64, device=self.device, dtype=self.dtype, generator=generator)
             positions = (
