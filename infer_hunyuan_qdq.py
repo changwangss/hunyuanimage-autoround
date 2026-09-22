@@ -23,6 +23,16 @@ def set_activation_qdq(model, enabled):
             layer.pre_dequantized_input = not enabled
 
 
+def use_rceil_activation_qdq(model):
+    """Diagnostic: use the activation scale rule from INC's FLUX example."""
+    for layer in model.modules():
+        if isinstance(layer, (MXFP4QuantLinear, MXFP8QuantLinear)):
+            # Config objects can be shared with other layers/the loaded model.
+            # Override runtime activation behavior without rewriting the recipe.
+            layer.config = deepcopy(layer.config)
+            layer.config.act_data_type = "mx_fp_rceil"
+
+
 def check_finite(name, tensor):
     if not torch.isfinite(tensor).all():
         raise RuntimeError(
@@ -181,12 +191,20 @@ def main():
         "--disable-act-quant", action="store_true", help="Diagnostic: keep saved weights but bypass activation QDQ"
     )
     parser.add_argument(
+        "--act-qdq",
+        choices=("checkpoint", "rceil"),
+        default="checkpoint",
+        help="Activation QDQ: saved configuration, or diagnostic RCEIL scales as in INC's FLUX example",
+    )
+    parser.add_argument(
         "--bf16",
         action="store_true",
         help="Reference run from the original unquantized checkpoint, preserving native mixed dtypes",
     )
     parser.add_argument("--max-memory", type=json.loads, help='GPU memory budgets, e.g. {"0":"70GiB","1":"70GiB"}')
     args = parser.parse_args()
+    if args.act_qdq != "checkpoint" and (args.bf16 or args.disable_act_quant):
+        parser.error("--act-qdq rceil cannot be combined with --bf16 or --disable-act-quant")
     args.model = args.model.resolve()
     if args.num_inference_steps < 1 or args.image_size == "auto":
         parser.error("Use positive inference steps and a fixed image size, e.g. 1024x1024")
@@ -222,6 +240,11 @@ def main():
     else:
         model = load_qdq_model(
             args.model, max_memory=max_memory, attn_implementation="sdpa", moe_impl="eager", moe_drop_tokens=True
+        )
+    if args.act_qdq == "rceil":
+        use_rceil_activation_qdq(model)
+        print(
+            "Diagnostic RCEIL activation QDQ enabled; weight values and per-layer activation bit widths are retained."
         )
     if args.disable_act_quant:
         set_activation_qdq(model, enabled=False)

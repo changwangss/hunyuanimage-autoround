@@ -5,7 +5,7 @@ Validated on 2026-09-22 against AutoRound commit
 
 ## Executed checks
 
-- Thirty-seven tests passed in `test_adapter.py`:
+- Forty-one tests passed in `test_adapter.py` (118.47 seconds):
   - Diagnostic hooks record denoising/VAE statistics, detect injected block/VAE
     NaNs, and restore hooks/methods after success and errors (three cases).
   - Native Tencent config save/reload changes `model_type` from
@@ -64,6 +64,18 @@ Validated on 2026-09-22 against AutoRound commit
   Hunyuan SDPA attention and its static KV cache, with finite outputs.
   The activation-bypass diagnostic agrees with weight-only reference calculations;
   the original-model mode rejects a quantized checkpoint before loading weights.
+- The four export cases additionally compare the actual post-tuning
+  `WrapperWALayer` outputs before packing against the reloaded torch MXFP QDQ
+  outputs, and compare a three-step synthetic attention/KV trajectory. Both
+  comparisons pass with exact equality, for MXFP8 and mixed MXFP8/MXFP4, in
+  memory and disk calibration modes (4 targeted cases passed in 31.32 seconds).
+- RCEIL diagnostic checks compare both A4 and A8 directly against the INC FLUX
+  example's `quant_mx_rceil` primitive, preserving packed weights/scales, each
+  layer's bit widths and the original configuration object. Two CLI checks reject
+  conflicting BF16/activation-bypass options. A BF16 input group containing
+  1.8984375 gives A8 outputs 1.75 with standard MX versus 1.875 with RCEIL; A4
+  gives 1.5 versus 2.0. These demonstrate different activation scale behavior,
+  not recovery of the full model's image quality.
 - Ruff lint and formatting checks passed for the Python files.
 - The CLI help command and pinned test-source SHA256 verification passed.
 

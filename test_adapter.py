@@ -191,6 +191,58 @@ def test_qdq_router_preserves_native_fp32_routing():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("bits", [4, 8])
+def test_rceil_activation_matches_flux_reference(bits):
+    from auto_round.data_type.mxfp import quant_mx_rceil
+
+    scheme = QuantizationScheme(
+        bits=bits,
+        act_bits=bits,
+        data_type="mx_fp",
+        act_data_type="mx_fp",
+        group_size=32,
+        act_group_size=32,
+        act_dynamic=True,
+    )
+    cls = MXFP4QuantLinear if bits == 4 else MXFP8QuantLinear
+    layer = cls(32, 32, scheme, dtype=torch.bfloat16)
+    layer.weight_scale.fill_(125)
+    if bits == 4:
+        layer.weight_packed.fill_(0x12)
+    else:
+        layer.weight.fill_(1.0)
+    model = nn.Sequential(layer)
+    saved = {key: value.clone() for key, value in model.state_dict().items()}
+    x = torch.zeros(1, 32, dtype=torch.bfloat16)
+    x[0, 0] = 1.9
+    standard = layer(x)
+    inference.use_rceil_activation_qdq(model)
+    expected_x, _, _ = quant_mx_rceil(x, bits=bits, group_size=32, data_type="mx_fp_rceil")
+    expected = torch.nn.functional.linear(expected_x, layer.dequant_weight_online().to(x.dtype))
+    torch.testing.assert_close(layer(x), expected, rtol=0, atol=0)
+    assert not torch.equal(standard, expected)
+    assert layer.config.act_bits == bits and layer.config.bits == bits
+    assert scheme.act_data_type == "mx_fp"
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value.float(), saved[key].float(), rtol=0, atol=0)
+    inference.set_activation_qdq(model, enabled=False)
+    torch.testing.assert_close(
+        layer(x), torch.nn.functional.linear(x, layer.dequant_weight_online().to(x.dtype)), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("conflict", ["--bf16", "--disable-act-quant"])
+def test_rceil_cli_rejects_conflicting_modes(monkeypatch, conflict):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["infer_hunyuan_qdq.py", "--model", "unused", "--prompt", "a cute cat", "--act-qdq", "rceil", conflict],
+    )
+    with pytest.raises(SystemExit) as error:
+        inference.main()
+    assert error.value.code == 2
+
+
 def test_qdq_generation_uses_full_inference_steps(monkeypatch, tmp_path):
     model = TinyModel(make_config())
     image = Image.new("RGB", (8, 8), "green")
@@ -546,6 +598,21 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
     assert quantizer.scheme_context.bits == quantizer.scheme_context.act_bits == 8
     for block, original in zip(model.model.layers, originals):
         block.forward = original
+    # Compare AutoRound's post-tuning fake-quant path with the reloaded torch
+    # backend, not just the packed checkpoint with another packed decoder.
+    from auto_round.wrapper import WrapperWALayer
+
+    model.to("cuda:0")
+    probe = torch.randn(1, 3, 64, device="cuda:0", dtype=torch.bfloat16)
+    with torch.no_grad(), compatible_cache_initialization(HunyuanStaticCache):
+        before_export = {
+            name: layer(probe).detach().cpu()
+            for name, layer in model.named_modules()
+            if isinstance(layer, WrapperWALayer)
+        }
+        before_export_generation = (
+            model.generate_image(seed=42, generation_config=SimpleNamespace(diff_infer_steps=3)).detach().cpu()
+        )
     quantizer.save_quantized(str(tmp_path / "export"), format="auto_round", inplace=True)
     configs = list((tmp_path / "export").rglob("config.json"))
     assert configs
@@ -577,6 +644,7 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
         if not hasattr(original, "weight_scale"):
             continue
         layer = loaded.get_submodule(name)
+        torch.testing.assert_close(layer(probe).cpu(), before_export[name], rtol=0, atol=0)
         bits = original.bits
         assert isinstance(layer, MXFP4QuantLinear if bits == 4 else MXFP8QuantLinear)
         weight_name = "weight_packed" if bits == 4 else "weight"
@@ -606,6 +674,7 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
     with compatible_cache_initialization(HunyuanStaticCache):
         output = loaded.generate_image(seed=42, generation_config=SimpleNamespace(diff_infer_steps=3))
     assert output.shape == (1, 2, 64) and torch.isfinite(output).all()
+    torch.testing.assert_close(output.cpu(), before_export_generation, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("failure", [False, True])

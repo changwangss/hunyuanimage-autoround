@@ -203,6 +203,17 @@ comparisons, changing the output name for each run:
 - Weight-only diagnostic: add `--disable-act-quant`, with output
   `outputs/weight_only.png`. Saved quantized weights/scales stay unchanged; only
   activation QDQ is bypassed. This is not a BF16 baseline or the target W8A8/W4A4 run.
+- RCEIL diagnostic: add `--act-qdq rceil`, with output `outputs/rceil.png`.
+  This uses the activation scale rule from the
+  [INC FLUX example](https://github.com/intel/neural-compressor/blob/main/examples/pytorch/diffusion_model/flux/main.py).
+  The example loads fake-quantized BF16 weights and applies `quant_mx_rceil`
+  before Linear. Here the AutoRound torch backend keeps the existing packed
+  weights and uses that same activation primitive via `act_data_type=mx_fp_rceil`.
+  Per-layer bit widths stay unchanged: W4A4 experts still use A4, not A8.
+  The default `--act-qdq checkpoint` follows the saved settings. An inference-only
+  RCEIL override is a diagnostic change to the tuned model's activation behavior;
+  if helpful, calibration and export should subsequently use matching activation
+  settings. It cannot be combined with `--bf16` or `--disable-act-quant`.
 - Original-model reference: `--model /path/to/original-model --bf16 --debug
   --output outputs/reference.png`. This uses the same native generation settings
   and preserves the original checkpoint's mixed dtypes. It requires enough memory
