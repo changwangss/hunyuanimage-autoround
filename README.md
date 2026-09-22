@@ -92,8 +92,14 @@ limit at this transition even when GPU calibration succeeds.
 
 With `--calib-cache-dir`, each forward's CPU snapshot is written immediately and
 released. The orchestrator reads only the current layer's snapshots, using private
-memory mappings. Step order, shared kwargs, calibration schedule, KV replay and
-quantization settings remain unchanged. Small tensor views are compacted before
+memory mappings. Disk mode now saves only KV positions that the current forward
+will not overwrite; replay rebuilds the full context from those saved values and
+freshly computed KV. Text/context KV, attention masks, position IDs and rotary
+embeddings are stored once when dtype, shape and tensor bytes match exactly.
+Deduplication compares content; it does not assume those tensors are constant.
+Each loaded reference uses a separate private mapping so in-place writes cannot
+corrupt another sample. Hidden states retain their original dtype and remain
+per-layer/per-step. Calibration steps and quantization settings do not change. Small tensor views are compacted before
 writing, avoiding serialization of their entire backing storage. Each run creates
 its own `hunyuan-calib-*` subdirectory; the script removes it when quantization
 finishes or raises an exception, before exporting. A forced kill/container restart
@@ -101,8 +107,21 @@ can leave this directory behind; it is not a resumable checkpoint.
 
 Use disk storage, not `/dev/shm` or another RAM-backed filesystem. Disk demand can
 be large and writing/re-reading adds I/O. The log reports the cache directory,
-approximate parameter storage and actual serialized cache size. File-cache pages
+approximate parameter storage and, after each prompt, actual serialized cache size,
+unique tensor payload by field, hidden-state dtype and a rough full-run projection.
+The projection assumes later prompts have a similar cost; shared data reuse and
+prompt lengths can change it. Per-field sizes exclude file-format overhead, which
+is included in the total. Equal tensors shared by different fields are attributed
+to the field that first wrote them. File-cache pages
 still participate in the OS/container memory accounting and may be reclaimed.
+
+The previous version (`7f1ab9b`) wrote full KV and repeated auxiliary tensors.
+The user observed 143G after five 1024x1024 prompts; that is roughly 915G for
+32 prompts at the same rate. The new compact/deduplicated format reduces these
+redundancies, but does not guarantee a small cache: distinct hidden states still
+scale with prompts × steps × layers. Start with one full-eight-step prompt to
+measure the new format before budgeting a 32-prompt run. Existing cache files are
+not converted; start a fresh run with the updated script.
 
 This reduces calibration-cache residency; it does **not** stream model weights or
 remove the full-model CPU requirement. Keep room for the original weights (roughly

@@ -100,20 +100,30 @@ def calibration_schedule(pipe, calib_steps, seed):
 class ReplayCache:
     """Replay one layer's static KV state without mutating saved calibration data."""
 
-    def __init__(self, keys, values):
+    def __init__(self, keys, values, positions=None, length=None):
         self.keys = keys
         self.values = values
+        self.positions = positions
+        self.length = length
 
     def update(self, keys, values, layer_idx, cache_kwargs):
         positions = cache_kwargs["cache_position"]
-        # Empty state is valid only for the initial full-context diffusion step.
-        if self.keys.shape[2] == 0:
+        if self.positions is not None and int(self.length.item()) > 0:
+            # Only untouched positions were saved. Updated positions are fully
+            # overwritten below, so their previous KV values are not needed.
+            shape = (keys.shape[0], keys.shape[1], int(self.length.item()), keys.shape[3])
+            indices = self.positions.to(keys.device)[:, None, :, None].expand_as(self.keys)
+            keys_out = keys.new_zeros(shape).scatter(2, indices, self.keys.to(keys))
+            values_out = values.new_zeros(shape).scatter(2, indices, self.values.to(values))
+        elif self.keys.shape[2] == 0:
+            # Empty state is valid only for the initial full-context step.
             expected = torch.arange(keys.shape[2], device=positions.device)
             if not torch.equal(positions, expected.expand_as(positions)):
                 raise RuntimeError("Initial KV replay requires the complete context.")
             return keys, values
-        keys_out = self.keys.to(keys).clone()
-        values_out = self.values.to(values).clone()
+        else:
+            keys_out = self.keys.to(keys).clone()
+            values_out = self.values.to(values).clone()
         if positions.ndim == 1:
             return (
                 keys_out.index_copy(2, positions, keys),
@@ -137,10 +147,12 @@ def install_replay_forward(block):
         custom_pos_emb=None,
         ar_keys=None,
         ar_values=None,
+        ar_kv_positions=None,
+        ar_kv_length=None,
         **kwargs,
     ):
         if past_key_value is None and ar_keys is not None:
-            past_key_value = ReplayCache(ar_keys, ar_values)
+            past_key_value = ReplayCache(ar_keys, ar_values, ar_kv_positions, ar_kv_length)
         return original(
             hidden_states,
             attention_mask=attention_mask,
@@ -161,6 +173,7 @@ class HunyuanCalibrator(DiffusionCalibrator):
 
     def __init__(self, quantizer, cache_dir=None):
         super().__init__(quantizer)
+        self.prompt_count = 0
         self.disk_cache = DiskCalibrationCache(cache_dir, self.shared_cache_keys) if cache_dir else None
         if self.disk_cache is not None:
             weights_gib = sum(p.numel() * p.element_size() for p in self.model.parameters()) / 1024**3
@@ -175,6 +188,8 @@ class HunyuanCalibrator(DiffusionCalibrator):
             self.disk_cache.close()
 
     def calib(self, nsamples, bs):
+        self.prompt_count = 0
+        self.requested_nsamples = nsamples
         super().calib(nsamples, bs)
         self.summary = {}
         if self.disk_cache is not None:
@@ -187,7 +202,7 @@ class HunyuanCalibrator(DiffusionCalibrator):
                 raise RuntimeError("Some calibration inputs were not written to disk")
             self.inputs = self.disk_cache
             print(
-                f"Calibration cache: {self.disk_cache.bytes_written / 1024**3:.2f} GiB on disk. "
+                f"Calibration cache: {self.disk_cache.report()}. "
                 "Tuning will read one layer at a time; full model weights still move to CPU.",
                 flush=True,
             )
@@ -215,14 +230,39 @@ class HunyuanCalibrator(DiffusionCalibrator):
                 shape = (hidden_states.shape[0], attn.num_key_value_heads, 0, attn.head_dim)
                 keys = hidden_states.new_empty(shape)
                 values = hidden_states.new_empty(shape)
+            elif self.disk_cache is not None:
+                if hidden_states.shape[0] != 1:
+                    raise ValueError("Compact Hunyuan calibration requires batch_size=1")
+                length = state.keys.shape[2]
+                keep = torch.ones(length, dtype=torch.bool, device=state.keys.device)
+                keep[kwargs["position_ids"].reshape(-1).to(keep.device)] = False
+                indices = keep.nonzero().flatten()
+                keys = state.keys.detach().index_select(2, indices).cpu()
+                values = state.values.detach().index_select(2, indices).cpu()
+                kwargs.update(ar_kv_positions=indices.cpu()[None], ar_kv_length=torch.tensor([length]))
             else:
                 # Copy before forward: Hunyuan updates its cache in place.
                 keys = state.keys.detach().to(device="cpu", copy=True)
                 values = state.values.detach().to(device="cpu", copy=True)
+            if self.disk_cache is not None and state.keys is None:
+                kwargs.update(ar_kv_positions=torch.empty(1, 0, dtype=torch.long), ar_kv_length=torch.tensor([0]))
             kwargs.update(ar_keys=keys, ar_values=values)
             result = capture(module, hidden_states, *args, **kwargs)
             if self.disk_cache is not None:
                 self.disk_cache.append(name, self.inputs.pop(name))
+                if module.layer_idx == len(self.model.model.layers) - 1:
+                    count = self.disk_cache.summary[name]["forwards"]
+                    if count % self.calib_num_inference_steps == 0:
+                        self.prompt_count += 1
+                        projected = (
+                            self.disk_cache.bytes_written / self.prompt_count * self.requested_nsamples / 1024**3
+                        )
+                        print(
+                            f"Calibration prompt {self.prompt_count}/{self.requested_nsamples}: "
+                            f"{self.disk_cache.report()}; hidden dtype={hidden_states.dtype}; "
+                            f"rough total at current rate={projected:.2f} GiB",
+                            flush=True,
+                        )
             return result
 
         return forward

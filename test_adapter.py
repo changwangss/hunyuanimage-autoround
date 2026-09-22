@@ -412,7 +412,8 @@ def rotary(positions, dtype):
     return phases.cos().to(dtype), phases.sin().to(dtype)
 
 
-def test_native_attention_replay_preserves_context_and_gradients():
+@pytest.mark.parametrize("compact", [False, True])
+def test_native_attention_replay_preserves_context_and_gradients(compact):
     torch.manual_seed(42)
     block = Block(make_config(), 0)
     original = install_replay_forward(block)
@@ -436,12 +437,27 @@ def test_native_attention_replay_preserves_context_and_gradients():
             expected = original(
                 query, position_ids=positions, past_key_value=live, custom_pos_emb=rotary(positions, query.dtype)
             )[0]
+        extra = {}
+        if compact:
+            keep = torch.tensor([[0, 1, 3]])
+            extra = {"ar_kv_positions": keep, "ar_kv_length": torch.tensor([5])}
+            keys, values = keys[:, :, keep[0]], values[:, :, keep[0]]
         actual = block(
-            query, position_ids=positions, ar_keys=keys, ar_values=values, custom_pos_emb=rotary(positions, query.dtype)
+            query,
+            position_ids=positions,
+            ar_keys=keys,
+            ar_values=values,
+            custom_pos_emb=rotary(positions, query.dtype),
+            **extra,
         )[0]
         torch.testing.assert_close(actual, expected)
         again = block(
-            query, position_ids=positions, ar_keys=keys, ar_values=values, custom_pos_emb=rotary(positions, query.dtype)
+            query,
+            position_ids=positions,
+            ar_keys=keys,
+            ar_values=values,
+            custom_pos_emb=rotary(positions, query.dtype),
+            **extra,
         )[0]
         torch.testing.assert_close(again, actual)
         actual.square().sum().backward()
@@ -626,7 +642,7 @@ def test_disk_cache_roundtrip_and_cleanup(tmp_path, failure):
         assert cache.pop("input_ids", None) is None
         loaded["hidden_states"][0].zero_()
         # The mapping is private, so replay mutations cannot modify saved data.
-        saved = torch.load(folder / "model.layers.0/000000.pt", weights_only=True)
+        saved = cache.read_snapshot(folder / "model.layers.0/000000.pt")
         torch.testing.assert_close(saved["hidden_states"][0], original)
         if failure:
             raise RuntimeError("injected calibration failure")
@@ -692,5 +708,42 @@ def test_disk_and_memory_calibration_and_tuning_agree(monkeypatch, tmp_path):
             results.append({name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()})
         finally:
             quantizer.calibration.close()
-    torch.testing.assert_close(captures[0], captures[1], rtol=0, atol=0)
+    for name, original in captures[0].items():
+        compact = captures[1][name]
+        for key in original:
+            if key not in ("ar_keys", "ar_values"):
+                torch.testing.assert_close(original[key], compact[key], rtol=0, atol=0)
+        for index, keys in enumerate(original["ar_keys"]):
+            if keys.shape[2] == 0:
+                assert compact["ar_kv_length"][index].item() == 0
+                continue
+            positions = compact["ar_kv_positions"][index][0]
+            assert positions.tolist() == [0, 1, 3]
+            torch.testing.assert_close(compact["ar_keys"][index], keys[:, :, positions], rtol=0, atol=0)
+            torch.testing.assert_close(
+                compact["ar_values"][index], original["ar_values"][index][:, :, positions], rtol=0, atol=0
+            )
     torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
+
+
+def test_disk_cache_deduplicates_equal_auxiliaries_without_aliasing(tmp_path):
+    from calibration_cache import DiskCalibrationCache, tensor_bytes
+
+    cache = DiskCalibrationCache(tmp_path)
+    mask = torch.ones(1, 1, 128, 128, dtype=torch.bool)
+    try:
+        for layer in range(4):
+            for step in range(3):
+                cache.append(f"layer.{layer}", {"attention_mask": [mask.clone()]})
+        assert cache.logical_bytes_by_field["attention_mask"] == 12 * tensor_bytes(mask)
+        assert cache.payload_bytes_by_field["attention_mask"] == tensor_bytes(mask)
+        assert len(list((cache.directory / "shared").glob("*.pt"))) == 1
+        loaded = cache["layer.0"]
+        loaded["attention_mask"][0].zero_()
+        assert loaded["attention_mask"][1].all()
+        assert cache["layer.1"]["attention_mask"][0].all()
+        # Identical bytes but different shapes/dtypes must remain different blobs.
+        cache.append("layer.4", {"attention_mask": [mask.reshape(1, 128, 128), mask.to(torch.uint8)]})
+        assert len(list((cache.directory / "shared").glob("*.pt"))) == 3
+    finally:
+        cache.close()

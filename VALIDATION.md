@@ -5,7 +5,7 @@ Validated on 2026-09-22 against AutoRound commit
 
 ## Executed checks
 
-- Twenty-nine tests passed in `test_adapter.py`:
+- Thirty-one tests passed in `test_adapter.py`:
   - Diagnostic hooks record denoising/VAE statistics, detect injected block/VAE
     NaNs, and restore hooks/methods after success and errors (three cases).
   - Native Tencent config save/reload changes `model_type` from
@@ -38,7 +38,11 @@ Validated on 2026-09-22 against AutoRound commit
 - Both MXFP8 and mixed MXFP8/MXFP4 tiny-model integration cases also run with disk
   caching, including real tuning, export, QDQ reload and finite replay outputs.
 - A separate two-prompt, full-eight-step comparison verifies exact equality of
-  cached inputs and final tuned state dictionaries between memory and disk paths.
+  all non-KV cached inputs, the retained KV positions, and final tuned state
+  dictionaries between full-memory and compact/deduplicated disk paths.
+- Native Hunyuan SDPA replay checks cover both full and compact KV, including
+  repeated replay and backward gradients. Tensor deduplication checks identical
+  content across layers/steps, dtype/shape distinctions, and mutation isolation.
 - The export tests check the resolved expert/shared-MLP/attention schemes,
   per-layer calibration forward counts and sequence lengths, serialized
   quantization settings, and expert weight packing dtype/shape.
@@ -58,7 +62,7 @@ Validated on 2026-09-22 against AutoRound commit
 
 ## Synthetic cache memory probe
 
-A CPU-only probe wrote 768 MiB of synthetic snapshots (16 layers, 8 forwards per
+For the previous full-snapshot version (`7f1ab9b`), a CPU-only probe wrote 768 MiB of synthetic snapshots (16 layers, 8 forwards per
 layer, three 2 MiB tensors per forward) in separate fresh processes:
 
 | Mode | RSS before capture | RSS after capture | RSS after reading first layer |
@@ -68,8 +72,27 @@ layer, three 2 MiB tensors per forward) in separate fresh processes:
 
 Both first-layer checksums were identical. These are process RSS readings, not
 whole-container memory measurements: filesystem page cache is not included in RSS.
+They are historical measurements of the full-snapshot implementation, not a new
+memory benchmark of the compact/deduplicated cache.
 The probe contains no full-model weights and is not a measurement of the user's
 32-prompt Hunyuan run or proof that its container restart is fixed.
+
+## Compact-cache disk probe
+
+A separate synthetic CPU probe used four layers, eight steps, hidden width 4096,
+512 updated tokens plus 128 context tokens, 8 KV heads of width 128 and BF16
+floating tensors. It compared the previous full-snapshot encoding with the new
+compact-KV and auxiliary-tensor deduplication:
+
+| Encoding | Serialized files |
+| --- | ---: |
+| Full snapshots | 220.78 MiB |
+| Compact KV + deduplication | 135.39 MiB |
+
+This reduced serialized bytes by 38.7%. The remaining tensor payload was dominated
+by 132 MiB of distinct hidden states. The probe uses synthetic tensors and a much
+shorter sequence than the real 1024x1024 model; it does not predict the full-run
+saving or establish a new container-memory peak.
 
 ## Environment
 
@@ -93,6 +116,8 @@ for the full model.
 - Complete HunyuanImage 3 Instruct Distil loading, COCO image-generation
   calibration, and tuning with the actual 80B checkpoint.
 - Multi-GPU full-model calibration and its peak CPU/GPU memory requirements.
+- Disk savings for the full 1024x1024, 32-prompt, 8-step user run. The old format
+  used 143G after five prompts; the new format requires a fresh measured run.
 - Reloading the exported full-model checkpoint in an inference engine.
 - Complete native Hunyuan QDQ generation from the exported 80B checkpoint.
 - Generated-image quality and comparison against the original model.
