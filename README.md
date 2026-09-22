@@ -15,6 +15,14 @@ with AutoRound main and its MXFP export dependencies installed. The model direct
 must contain the complete native checkpoint, Python files, tokenizer, and assets.
 Tencent requires a directory name without dots, for example `HunyuanImage-3-Instruct-Distil`.
 
+Both scripts explicitly load the complete `tokenizer.json` backend into Tencent's
+custom tokenizer and check its encoding. Transformers 5.12.1's default custom
+tokenizer loading was observed to lose BPE merges and pre-tokenization, changing
+`a cute cat` from 3 tokens to 8 letter tokens. This affects both calibration and
+inference, including BF16. If calibration used that broken tokenizer, verify
+BF16 generation after updating, then repeat calibration and quantization; an
+inference-only change does not repair the previous tuning inputs.
+
 Start with a small smoke run:
 
 ```bash

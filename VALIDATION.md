@@ -69,6 +69,13 @@ Validated on 2026-09-22 against AutoRound commit
   outputs, and compare a three-step synthetic attention/KV trajectory. Both
   comparisons pass with exact equality, for MXFP8 and mixed MXFP8/MXFP4, in
   memory and disk calibration modes (4 targeted cases passed in 31.32 seconds).
+- A further direct weight comparison exports the same tuned model through
+  AutoRound's actual `fake` exporter, then through the packed `auto_round`
+  exporter. Each fake-file weight exactly matches the pre-export tuned weight;
+  each packed/reloaded weight, dequantized and cast to that fake weight's dtype,
+  also matches exactly (`rtol=0, atol=0`). All four MXFP8/mixed and memory/disk
+  cases passed in 31.77 seconds. This covers the tiny model, not the user's
+  complete checkpoint.
 - RCEIL diagnostic checks compare both A4 and A8 directly against the INC FLUX
   example's `quant_mx_rceil` primitive, preserving packed weights/scales, each
   layer's bit widths and the original configuration object. Two CLI checks reject
@@ -132,6 +139,24 @@ new container-memory peak.
 This records the small-test environment, not a validated dependency lock for the
 complete Tencent custom model. Use a working official HunyuanImage environment
 for the full model.
+
+## Tokenizer compatibility
+
+Tokenizer diagnosis: using the actual Tencent tokenizer class and checkpoint
+`tokenizer.json`, Transformers 5.12.1's native `from_pretrained` returned
+`[64, 66, 84, 83, 68, 66, 64, 83]` for `a cute cat`, instead of the checkpoint
+backend's `[64, 19369, 8415]`. The loaded backend had zero BPE merges and no
+pre-tokenizer or decoder. Supplying `tokenizer_object` preserves these components;
+supplying only `tokenizer_file` did not fix the reproduction. Both entry points
+now use the same explicit backend loader. A regression test uses the pinned
+Tencent tokenizer class and a small local BPE checkpoint, checking English and
+Chinese token IDs and backend components. This identifies a real conditioning
+bug but does not yet prove the cause of the user's full-model image result.
+The regression failed with the old native loader and passes with the explicit
+backend. The complete suite passed: 42 tests, 4 expected loading warnings,
+120.93 seconds. A separate check with the actual checkpoint tokenizer verified
+English/Chinese prompts inside the full 1024x1024 image-generation template,
+including guidance and MeanFlow tokens; no 80B weights were loaded for that check.
 
 ## Not yet validated
 

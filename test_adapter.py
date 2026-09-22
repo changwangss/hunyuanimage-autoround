@@ -25,6 +25,7 @@ from quantize_hunyuan_mxfp8 import (
     calibration_schedule,
     compatible_cache_initialization,
     install_replay_forward,
+    load_hunyuan_tokenizer,
     parse_args,
     validate_hunyuan_config,
 )
@@ -56,6 +57,46 @@ def native_cache_class():
 
 
 HunyuanStaticCache = native_cache_class()
+
+
+def test_native_tokenizer_preserves_checkpoint_backend(monkeypatch, tmp_path):
+    from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers
+    from transformers import PreTrainedTokenizerFast
+
+    source = Path(__file__).parent / "reference/tokenization_hunyuan_image_3.py"
+    spec = importlib.util.spec_from_file_location("native_hunyuan_tokenizer_test", source)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    prompts = ["a cute cat", "a red car", "一只可爱的猫"]
+    special = ["<|startoftext|>", "<|endoftext|>", "<pad>"] + [f"<img_ratio_{i}>" for i in range(37)]
+    backend.train_from_iterator(prompts * 10, trainers.BpeTrainer(vocab_size=500, special_tokens=special))
+    PreTrainedTokenizerFast(
+        tokenizer_object=backend, bos_token=special[0], eos_token=special[1], pad_token=special[2]
+    ).save_pretrained(tmp_path)
+
+    class TinyHunyuan:
+        def load_tokenizer(self, path):
+            self._tokenizer = module.HunyuanImage3TokenizerFast.from_pretrained(
+                path, model_version=self.config.model_version
+            )
+
+    TinyHunyuan.__module__ = spec.name
+    model = TinyHunyuan()
+    model.config = SimpleNamespace()
+    load_hunyuan_tokenizer(model, tmp_path)
+    assert isinstance(model._tokenizer, module.HunyuanImage3TokenizerFast)
+    for prompt in prompts:
+        expected = backend.encode(prompt, add_special_tokens=False).ids
+        assert model._tokenizer.encode(prompt, add_special_tokens=False) == expected
+        assert model._tokenizer.decode(expected, clean_up_tokenization_spaces=False) == prompt
+    saved = json.loads((tmp_path / "tokenizer.json").read_text())
+    loaded = json.loads(model._tokenizer.backend_tokenizer.to_str())
+    for key in ("model", "normalizer", "pre_tokenizer", "post_processor", "decoder"):
+        assert loaded[key] == saved[key]
 
 
 def test_native_config_roundtrip_is_accepted_by_qdq_cli(monkeypatch, tmp_path):
@@ -613,6 +654,25 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
         before_export_generation = (
             model.generate_image(seed=42, generation_config=SimpleNamespace(diff_infer_steps=3)).detach().cpu()
         )
+        tuned_weights = {
+            name: layer.weight.detach().cpu().clone()
+            for name, layer in model.named_modules()
+            if isinstance(layer, WrapperWALayer)
+        }
+    # Exercise AutoRound's real fake exporter using the very same tuned weights.
+    # save_quantized caches its selected formats; change that selection before
+    # the second export so it actually invokes the packed exporter below.
+    from safetensors.torch import load_file
+
+    quantizer.save_quantized(str(tmp_path / "fake"), format="fake", inplace=True)
+    fake_weights = {}
+    for shard in (tmp_path / "fake").glob("*.safetensors"):
+        fake_weights.update(load_file(shard))
+    for name, weight in tuned_weights.items():
+        torch.testing.assert_close(fake_weights[name + ".weight"], weight, rtol=0, atol=0)
+        assert name + ".weight_scale" not in fake_weights
+        assert name + ".weight_packed" not in fake_weights
+    quantizer.formats = "auto_round"
     quantizer.save_quantized(str(tmp_path / "export"), format="auto_round", inplace=True)
     configs = list((tmp_path / "export").rglob("config.json"))
     assert configs
@@ -645,6 +705,10 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
             continue
         layer = loaded.get_submodule(name)
         torch.testing.assert_close(layer(probe).cpu(), before_export[name], rtol=0, atol=0)
+        fake_weight = fake_weights[name + ".weight"]
+        torch.testing.assert_close(
+            layer.dequant_weight_online().to(device="cpu", dtype=fake_weight.dtype), fake_weight, rtol=0, atol=0
+        )
         bits = original.bits
         assert isinstance(layer, MXFP4QuantLinear if bits == 4 else MXFP8QuantLinear)
         weight_name = "weight_packed" if bits == 4 else "weight"

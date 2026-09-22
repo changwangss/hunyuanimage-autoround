@@ -14,7 +14,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoRoundConfig
 
 from auto_round.experimental.qmodules.mx import MXFP4QuantLinear, MXFP8QuantLinear
-from quantize_hunyuan_mxfp8 import compatible_cache_initialization, validate_hunyuan_config
+from quantize_hunyuan_mxfp8 import compatible_cache_initialization, load_hunyuan_tokenizer, validate_hunyuan_config
 
 
 def set_activation_qdq(model, enabled):
@@ -249,9 +249,7 @@ def main():
     if args.disable_act_quant:
         set_activation_qdq(model, enabled=False)
         print("Activation QDQ disabled for diagnosis; saved quantized weights are unchanged.")
-    if not hasattr(model.config, "model_version"):
-        model.config.model_version = "HunyuanImage-3.0-Instruct"
-    model.load_tokenizer(str(args.model))
+    load_hunyuan_tokenizer(model, args.model)
     if args.debug:
         import auto_round
         import transformers

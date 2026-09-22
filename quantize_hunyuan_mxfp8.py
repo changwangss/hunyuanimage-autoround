@@ -28,6 +28,31 @@ from auto_round.utils import parse_layer_config_arg
 from calibration_cache import DiskCalibrationCache
 
 
+def load_hunyuan_tokenizer(model, model_dir):
+    """Preserve the checkpoint's complete backend in Tencent's custom tokenizer."""
+    from tokenizers import Tokenizer
+
+    if not hasattr(model.config, "model_version"):
+        model.config.model_version = "HunyuanImage-3.0-Instruct"
+    backend = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
+    tokenizer_class = sys.modules[type(model).__module__].HunyuanImage3TokenizerFast
+    # Transformers 5 can reconstruct custom tokenizer subclasses without their
+    # BPE merges/pre-tokenizer. Passing tokenizer_file alone does not avoid this.
+    model._tokenizer = tokenizer_class.from_pretrained(
+        str(model_dir),
+        local_files_only=True,
+        model_version=model.config.model_version,
+        tokenizer_object=backend,
+    )
+    for text in ("a cute cat", "一只可爱的猫"):
+        if (
+            model._tokenizer.encode(text, add_special_tokens=False)
+            != backend.encode(text, add_special_tokens=False).ids
+        ):
+            raise RuntimeError("Native tokenizer encoding differs from the checkpoint tokenizer.json")
+    print("Verified native tokenizer encoding against tokenizer.json.", flush=True)
+
+
 def validate_hunyuan_config(config):
     """Accept the published model type and the native config's serialized alias."""
     model_type = config.get("model_type")
@@ -499,10 +524,7 @@ def main():
     device_map = getattr(model, "hf_device_map", {})
     if any(str(device) in {"cpu", "disk"} for device in device_map.values()):
         raise RuntimeError("Calibration currently requires GPU-resident weights; provide enough visible GPUs.")
-    # Older Distil configs omit this field, but the native tokenizer requires it (Tencent issue #83).
-    if not hasattr(model.config, "model_version"):
-        model.config.model_version = "HunyuanImage-3.0-Instruct"
-    model.load_tokenizer(str(args.model))
+    load_hunyuan_tokenizer(model, args.model)
     quantizer, original_forwards = build_quantizer(model, args)
     print(
         f"Quantizing {len(original_forwards)} decoder blocks using {args.nsamples} COCO prompts x "
