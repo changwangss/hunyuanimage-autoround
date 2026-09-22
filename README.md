@@ -1,0 +1,102 @@
+# HunyuanImage 3 Instruct Distil: MXFP8 with AutoRound
+
+Standalone experimental Python API script. It does not edit AutoRound source files.
+The implementation targets AutoRound main `6db9435fbff63cf17e2df2c5a8ca858392df5eab`
+and Tencent's native checkpoint revision `c8ffd07206f1b843697606968196e8f59f8ff38c`.
+
+Model: [tencent/HunyuanImage-3.0-Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil).
+Quantization library: [intel/auto-round](https://github.com/intel/auto-round).
+This is an experimental standalone adapter, not an official Tencent or AutoRound integration.
+
+## Run
+
+Use the environment in which the official model's `generate_image()` already works,
+with AutoRound main and its MXFP export dependencies installed. The model directory
+must contain the complete native checkpoint, Python files, tokenizer, and assets.
+Tencent requires a directory name without dots, for example `HunyuanImage-3-Instruct-Distil`.
+
+Start with a small smoke run:
+
+```bash
+python quantize_hunyuan_mxfp8.py \
+  --model /path/to/HunyuanImage-3-Instruct-Distil \
+  --output /path/to/HunyuanImage-3-Instruct-Distil-MXFP8-smoke \
+  --nsamples 1 --steps 8 --iters 2
+```
+
+Then use a separate output directory for tuning:
+
+```bash
+python quantize_hunyuan_mxfp8.py \
+  --model /path/to/HunyuanImage-3-Instruct-Distil \
+  --output /path/to/HunyuanImage-3-Instruct-Distil-MXFP8 \
+  --nsamples 8 --steps 8 --iters 200 \
+  --layer_config '{mlp.experts:{scheme:MXFP4}}' \
+  --image-size 1024x1024 --device 0
+```
+
+The optional `--layer_config` above sets routed experts to MXFP4 (W4A4), while
+attention and the shared MLP retain MXFP8 (W8A8). Omit it for uniform MXFP8.
+The equivalent Python API argument is
+`layer_config={"mlp.experts": {"scheme": "MXFP4"}}`.
+
+`--nsamples` counts COCO captions, not denoising steps. Eight captions and eight
+steps yield 64 calibration forwards per decoder block. This is a starting recipe,
+not a measured quality recommendation. The script uses direct text-to-image
+generation (`bot_task="image"`), not CoT, prompt rewriting, or image editing.
+
+Weights load with Accelerate `device_map="auto"` across visible GPUs; `--device`
+selects the tuning GPU. All model weights must fit on the visible GPUs during
+calibration, with headroom for generation. CPU/disk weight offload is not supported
+by this adapter. `--max-memory '{"0":"70GiB","1":"70GiB"}'` can reserve GPU
+headroom (extend this example to include all GPUs available for this model).
+After calibration, AutoRound moves weights to CPU and tunes blocks individually;
+allow host RAM for the full model plus calibration snapshots. This script is not
+an optimized low-memory loader for an 80B model.
+
+## What is quantized and exported
+
+- `scheme="MXFP8"`: 8-bit MX floating-point weights and dynamic 8-bit activations,
+  group size 32. `--layer_config` can override this for matched layers.
+- Each `model.layers.N` decoder block is a separate tuning group. Eager MoE keeps
+  experts as Linear modules so AutoRound can quantize their projections.
+- VAE, ViT, alignment modules, and the language output head stay outside the target
+  blocks. This is not a claim that every model parameter becomes 8-bit.
+- Export is explicitly `format="auto_round"`, preserving the native Transformers
+  root checkpoint layout. It is not `llm_compressor`, fake quantization, or a newly
+  created Diffusers model folder.
+- The original model's config, custom code and tokenizer support files are retained.
+  Loading the exported custom architecture with a specific inference engine and
+  checking generated-image quality are separate validation steps.
+
+## Why there is an adapter
+
+AutoRound currently classifies this checkpoint as MLLM. A small DiffusionPipeline
+wrapper calls its native `generate_image()` and routes COCO prompts to diffusion
+calibration. Two temporary constructor patches bypass the generic Diffusers loader
+and preserve the native mixed dtypes. These are process-local and restored immediately.
+
+Hunyuan's later denoising steps reuse per-layer text KV state. The stock generic
+calibration collector drops the custom cache object. This script captures each
+layer's KV tensors before its forward, and reconstructs the static-cache update
+for replay. Every replay uses fresh tensors and supports gradients. Each decoder
+layer has its own calibration group, so another layer's KV state cannot be reused
+accidentally. Taylor cache is disabled so every denoising step executes.
+
+## Validation boundary
+
+`test_adapter.py` checks cached attention replay against Tencent's published SDPA
+implementation, and runs small-model CUDA MXFP8 tuning and AutoRound export.
+The tiny model supplies synthetic denoising inputs and mocked COCO captions.
+These checks do not replace running the complete 80B model, checkpoint reload,
+or image-quality evaluation. See [VALIDATION.md](VALIDATION.md) for the test results
+and environment. Tests require a CUDA GPU and pytest.
+
+The test reference source is downloaded from a pinned Tencent revision and checked
+against its SHA256. It is not bundled with this repository. Model weights and
+generated checkpoints are not included either.
+
+```bash
+python prepare_test_reference.py
+PYTHONPATH=/path/to/auto-round python -m pytest test_adapter.py -q
+```

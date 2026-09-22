@@ -1,0 +1,14 @@
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+*.log
+.venv/
+.env
+.env.*
+reference/
+outputs/
+*.safetensors
+*.bin
+*.pt
+*.pth
