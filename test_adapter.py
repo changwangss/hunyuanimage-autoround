@@ -11,8 +11,9 @@ import pytest
 import torch
 from torch import nn
 from transformers import LlamaConfig, PreTrainedModel
+from transformers.cache_utils import StaticCache
 
-from quantize_hunyuan_mxfp8 import build_quantizer, install_replay_forward
+from quantize_hunyuan_mxfp8 import build_quantizer, compatible_cache_initialization, install_replay_forward
 from auto_round.utils import parse_layer_config_arg
 
 
@@ -25,6 +26,54 @@ def attention_class():
     env = {"torch": torch, "nn": nn}
     exec(compile("from __future__ import annotations\n" + ast.unparse(ast.Module(nodes, [])), str(source), "exec"), env)
     return env["HunyuanImage3SDPAAttention"]
+
+
+def native_cache_class():
+    source = Path(__file__).parent / "reference/modeling_hunyuan_image_3.py"
+    tree = ast.parse(source.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HunyuanStaticCache")
+    env = {"torch": torch, "StaticCache": StaticCache}
+    exec(compile("from __future__ import annotations\n" + ast.unparse(node), str(source), "exec"), env)
+    return env["HunyuanStaticCache"]
+
+
+HunyuanStaticCache = native_cache_class()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_native_cache_initialization_and_updates(legacy):
+    cache = HunyuanStaticCache(config=make_config(), max_cache_len=5, dynamic=False)
+
+    class LegacyLayer:
+        keys = None
+        values = None
+
+        def lazy_initialization(self, key_states):
+            shape = (*key_states.shape[:2], 5, key_states.shape[-1])
+            self.keys = key_states.new_zeros(shape)
+            self.values = key_states.new_zeros(shape)
+
+    if legacy:
+        cache.layers[0] = LegacyLayer()
+    original_update = HunyuanStaticCache.update
+    keys = torch.randn(1, 2, 5, 32)
+    values = torch.randn_like(keys)
+    with compatible_cache_initialization(HunyuanStaticCache):
+        actual_k, actual_v = cache.update(keys, values, 0, {"cache_position": torch.arange(5)[None]})
+        torch.testing.assert_close(actual_k, keys)
+        torch.testing.assert_close(actual_v, values)
+        new_k, new_v = torch.randn(1, 2, 2, 32), torch.randn(1, 2, 2, 32)
+        actual_k, actual_v = cache.update(new_k, new_v, 0, {"cache_position": torch.tensor([[2, 4]])})
+        expected_k, expected_v = keys.clone(), values.clone()
+        expected_k[:, :, [2, 4]] = new_k
+        expected_v[:, :, [2, 4]] = new_v
+        torch.testing.assert_close(actual_k, expected_k)
+        torch.testing.assert_close(actual_v, expected_v)
+    assert HunyuanStaticCache.update is original_update
+    with pytest.raises(RuntimeError, match="generation failed"):
+        with compatible_cache_initialization(HunyuanStaticCache):
+            raise RuntimeError("generation failed")
+    assert HunyuanStaticCache.update is original_update
 
 
 class NativeCache:
@@ -134,7 +183,7 @@ class TinyModel(PreTrainedModel):
     def generate_image(self, **kwargs):
         self.calls.append(kwargs)
         generator = torch.Generator(device=self.device).manual_seed(kwargs["seed"])
-        cache = NativeCache(2, 5)
+        cache = HunyuanStaticCache(config=self.config, max_cache_len=5, dynamic=False)
         for step in range(kwargs["diff_infer_steps"]):
             length = 5 if step == 0 else 2
             h = torch.randn(1, length, 64, device=self.device, dtype=self.dtype, generator=generator)

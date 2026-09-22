@@ -6,9 +6,12 @@ No AutoRound source files are changed. See README.md for validation boundaries.
 """
 
 import argparse
+import inspect
 import json
 import shutil
+import sys
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from types import MethodType
 from unittest.mock import patch
@@ -21,6 +24,22 @@ from auto_round.calibration.diffusion import DiffusionCalibrator
 from auto_round.compressors.base import BaseOrchestrator
 from auto_round.compressors.diffusion_mixin import DiffusionMixin
 from auto_round.utils import parse_layer_config_arg
+
+
+@contextmanager
+def compatible_cache_initialization(cache_class):
+    """Bridge native Hunyuan's one-argument call to newer Transformers caches."""
+    original_update = cache_class.update
+
+    def update(cache, key_states, value_states, layer_idx, cache_kwargs=None):
+        layer = cache.layers[layer_idx]
+        if layer.keys is None and "value_states" in inspect.signature(layer.lazy_initialization).parameters:
+            # Initialize with both tensors before the native update reaches its old call.
+            layer.lazy_initialization(key_states, value_states)
+        return original_update(cache, key_states, value_states, layer_idx, cache_kwargs)
+
+    with patch.object(cache_class, "update", update):
+        yield
 
 
 class ReplayCache:
@@ -144,19 +163,21 @@ class HunyuanPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(self, prompt, guidance_scale=5.0, num_inference_steps=8, generator=None):
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
-        for text in prompts:
-            self.transformer.generate_image(
-                prompt=text,
-                seed=self.seed + self.prompt_count,
-                image_size=self.image_size,
-                bot_task="image",
-                use_system_prompt="en_unified",
-                diff_infer_steps=num_inference_steps,
-                diff_guidance_scale=guidance_scale,
-                use_taylor_cache=False,
-                verbose=0,
-            )
-            self.prompt_count += 1
+        model_module = sys.modules[type(self.transformer).__module__]
+        with compatible_cache_initialization(model_module.HunyuanStaticCache):
+            for text in prompts:
+                self.transformer.generate_image(
+                    prompt=text,
+                    seed=self.seed + self.prompt_count,
+                    image_size=self.image_size,
+                    bot_task="image",
+                    use_system_prompt="en_unified",
+                    diff_infer_steps=num_inference_steps,
+                    diff_guidance_scale=guidance_scale,
+                    use_taylor_cache=False,
+                    verbose=0,
+                )
+                self.prompt_count += 1
 
 
 def build_quantizer(model, args):
@@ -290,6 +311,9 @@ def main():
     device_map = getattr(model, "hf_device_map", {})
     if any(str(device) in {"cpu", "disk"} for device in device_map.values()):
         raise RuntimeError("Calibration currently requires GPU-resident weights; provide enough visible GPUs.")
+    # Older Distil configs omit this field, but the native tokenizer requires it (Tencent issue #83).
+    if not hasattr(model.config, "model_version"):
+        model.config.model_version = "HunyuanImage-3.0-Instruct"
     model.load_tokenizer(str(args.model))
     quantizer, original_forwards = build_quantizer(model, args)
     print(f"Quantizing {len(original_forwards)} decoder blocks using {args.nsamples} COCO prompts x {args.steps} steps")

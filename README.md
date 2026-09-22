@@ -76,6 +76,13 @@ wrapper calls its native `generate_image()` and routes COCO prompts to diffusion
 calibration. Two temporary constructor patches bypass the generic Diffusers loader
 and preserve the native mixed dtypes. These are process-local and restored immediately.
 
+The script also fills a missing `model_version` with Tencent's Instruct default
+before loading the tokenizer. During native image generation, a scoped cache
+adapter supplies both key and value tensors when the installed Transformers
+`StaticLayer.lazy_initialization` requires them. Older single-argument
+initializers keep the native path. No installed Transformers or model source
+files are modified.
+
 Hunyuan's later denoising steps reuse per-layer text KV state. The stock generic
 calibration collector drops the custom cache object. This script captures each
 layer's KV tensors before its forward, and reconstructs the static-cache update

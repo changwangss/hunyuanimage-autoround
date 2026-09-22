@@ -5,7 +5,10 @@ Validated on 2026-09-22 against AutoRound commit
 
 ## Executed checks
 
-- Three tests passed in `test_adapter.py`:
+- Five tests passed in `test_adapter.py`:
+  - Native Hunyuan static cache with the installed two-argument initializer,
+    including initial and subsequent indexed KV updates and patch restoration.
+  - The same native cache with a simulated legacy single-argument initializer.
   - Tencent's published SDPA attention with RoPE: initial and later-step KV
     replay agreement, repeated replay, and gradient propagation.
   - CUDA tiny-model W8A8 MXFP8 tuning and `auto_round` export.
@@ -41,8 +44,12 @@ for the full model.
 - Reloading the exported full-model checkpoint in an inference engine.
 - Generated-image quality and comparison against the original model.
 
-The tiny-model integration tests use synthetic denoising inputs, a small MoE-like
-module, and mocked COCO captions. They do not validate the full Tencent MoE or
+The tiny-model integration tests use the published Hunyuan static cache,
+synthetic denoising inputs, a small MoE-like module, and mocked COCO captions.
+The original tests used a simplified cache and missed the Transformers
+`lazy_initialization(key_states, value_states)` incompatibility. This was
+reproduced against Transformers 5.12.1 and covered by the updated tests.
+They do not validate the full Tencent MoE or
 native image-generation pipeline. The published attention source is pinned at
 Tencent revision `c8ffd07206f1b843697606968196e8f59f8ff38c` and verified by
 `prepare_test_reference.py` before testing.
