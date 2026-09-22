@@ -72,6 +72,44 @@ After calibration, AutoRound moves weights to CPU and tunes blocks individually;
 allow host RAM for the full model plus calibration snapshots. This script is not
 an optimized low-memory loader for an 80B model.
 
+## Reduce CPU memory used by calibration snapshots
+
+For larger calibration runs, add a directory on a disk with enough free space:
+
+```bash
+python quantize_hunyuan_mxfp8.py \
+  --model /path/to/HunyuanImage-3-Instruct-Distil \
+  --output /path/to/HunyuanImage-Mixed-Tuned \
+  --nsamples 32 --num_inference_steps 8 --calib_num_inference_steps 8 --iters 200 \
+  --layer_config '{mlp.experts:{scheme:MXFP4}}' \
+  --calib-cache-dir /path/to/large-disk/calibration-cache
+```
+
+Without this option, calibration stores all layers' inputs and per-step KV
+snapshots in CPU memory. AutoRound then moves the full unquantized model to CPU
+before tuning, so both allocations coexist. A container can exceed its CPU memory
+limit at this transition even when GPU calibration succeeds.
+
+With `--calib-cache-dir`, each forward's CPU snapshot is written immediately and
+released. The orchestrator reads only the current layer's snapshots, using private
+memory mappings. Step order, shared kwargs, calibration schedule, KV replay and
+quantization settings remain unchanged. Small tensor views are compacted before
+writing, avoiding serialization of their entire backing storage. Each run creates
+its own `hunyuan-calib-*` subdirectory; the script removes it when quantization
+finishes or raises an exception, before exporting. A forced kill/container restart
+can leave this directory behind; it is not a resumable checkpoint.
+
+Use disk storage, not `/dev/shm` or another RAM-backed filesystem. Disk demand can
+be large and writing/re-reading adds I/O. The log reports the cache directory,
+approximate parameter storage and actual serialized cache size. File-cache pages
+still participate in the OS/container memory accounting and may be reclaimed.
+
+This reduces calibration-cache residency; it does **not** stream model weights or
+remove the full-model CPU requirement. Keep room for the original weights (roughly
+160 GB for 80B BF16 parameters), the active layer, reference outputs and temporary
+allocations. GPU cache placement/tuning policy is unchanged. If the container
+cannot fit the original weights themselves, this option alone is insufficient.
+
 ## What is quantized and exported
 
 - `scheme="MXFP8"`: 8-bit MX floating-point weights and dynamic 8-bit activations,

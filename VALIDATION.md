@@ -5,7 +5,7 @@ Validated on 2026-09-22 against AutoRound commit
 
 ## Executed checks
 
-- Twenty-three tests passed in `test_adapter.py`:
+- Twenty-nine tests passed in `test_adapter.py`:
   - Diagnostic hooks record denoising/VAE statistics, detect injected block/VAE
     NaNs, and restore hooks/methods after success and errors (three cases).
   - Native Tencent config save/reload changes `model_type` from
@@ -32,6 +32,13 @@ Validated on 2026-09-22 against AutoRound commit
     replay agreement, repeated replay, and gradient propagation.
   - CUDA tiny-model W8A8 MXFP8 tuning and `auto_round` export.
   - CUDA tiny-model MXFP8 with W4A4 MXFP4 expert overrides and `auto_round` export.
+- Disk-cache checks cover lazy per-layer reads, shared per-step positions,
+  tuple kwargs, empty KV snapshots, private-mapping isolation, compact tensor
+  views, low-disk-space errors, and temporary-directory cleanup.
+- Both MXFP8 and mixed MXFP8/MXFP4 tiny-model integration cases also run with disk
+  caching, including real tuning, export, QDQ reload and finite replay outputs.
+- A separate two-prompt, full-eight-step comparison verifies exact equality of
+  cached inputs and final tuned state dictionaries between memory and disk paths.
 - The export tests check the resolved expert/shared-MLP/attention schemes,
   per-layer calibration forward counts and sequence lengths, serialized
   quantization settings, and expert weight packing dtype/shape.
@@ -48,6 +55,21 @@ Validated on 2026-09-22 against AutoRound commit
   the original-model mode rejects a quantized checkpoint before loading weights.
 - Ruff lint and formatting checks passed for the Python files.
 - The CLI help command and pinned test-source SHA256 verification passed.
+
+## Synthetic cache memory probe
+
+A CPU-only probe wrote 768 MiB of synthetic snapshots (16 layers, 8 forwards per
+layer, three 2 MiB tensors per forward) in separate fresh processes:
+
+| Mode | RSS before capture | RSS after capture | RSS after reading first layer |
+| --- | ---: | ---: | ---: |
+| In memory | 486.6 MiB | 1258.1 MiB | 1259.7 MiB |
+| On disk | 486.6 MiB | 495.1 MiB | 544.9 MiB |
+
+Both first-layer checksums were identical. These are process RSS readings, not
+whole-container memory measurements: filesystem page cache is not included in RSS.
+The probe contains no full-model weights and is not a measurement of the user's
+32-prompt Hunyuan run or proof that its container restart is fixed.
 
 ## Environment
 

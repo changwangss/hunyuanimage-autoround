@@ -25,6 +25,7 @@ from auto_round.calibration.diffusion import DiffusionCalibrator
 from auto_round.compressors.base import BaseOrchestrator
 from auto_round.compressors.diffusion_mixin import DiffusionMixin
 from auto_round.utils import parse_layer_config_arg
+from calibration_cache import DiskCalibrationCache
 
 
 def validate_hunyuan_config(config):
@@ -158,9 +159,39 @@ def install_replay_forward(block):
 class HunyuanCalibrator(DiffusionCalibrator):
     """Save per-layer KV tensors that the generic cache collector would omit."""
 
+    def __init__(self, quantizer, cache_dir=None):
+        super().__init__(quantizer)
+        self.disk_cache = DiskCalibrationCache(cache_dir, self.shared_cache_keys) if cache_dir else None
+        if self.disk_cache is not None:
+            weights_gib = sum(p.numel() * p.element_size() for p in self.model.parameters()) / 1024**3
+            print(
+                f"Writing calibration snapshots to {self.disk_cache.directory}. "
+                f"Model parameters alone require approximately {weights_gib:.2f} GiB on CPU before tuning.",
+                flush=True,
+            )
+
+    def close(self):
+        if self.disk_cache is not None:
+            self.disk_cache.close()
+
     def calib(self, nsamples, bs):
         super().calib(nsamples, bs)
         self.summary = {}
+        if self.disk_cache is not None:
+            expected = nsamples * self.calib_num_inference_steps
+            for name, info in self.disk_cache.summary.items():
+                if info["forwards"] != expected or info["kv_forwards"] != expected:
+                    raise RuntimeError(f"{name}: expected {expected} forwards and KV snapshots, got {info}")
+                self.summary[name] = {key: info[key] for key in ("forwards", "sequence_lengths")}
+            if self.inputs:
+                raise RuntimeError("Some calibration inputs were not written to disk")
+            self.inputs = self.disk_cache
+            print(
+                f"Calibration cache: {self.disk_cache.bytes_written / 1024**3:.2f} GiB on disk. "
+                "Tuning will read one layer at a time; full model weights still move to CPU.",
+                flush=True,
+            )
+            return
         for name, inputs in self.inputs.items():
             count = len(inputs["hidden_states"])
             if count != nsamples * self.calib_num_inference_steps:
@@ -186,11 +217,25 @@ class HunyuanCalibrator(DiffusionCalibrator):
                 values = hidden_states.new_empty(shape)
             else:
                 # Copy before forward: Hunyuan updates its cache in place.
-                keys, values = state.keys.detach().cpu().clone(), state.values.detach().cpu().clone()
+                keys = state.keys.detach().to(device="cpu", copy=True)
+                values = state.values.detach().to(device="cpu", copy=True)
             kwargs.update(ar_keys=keys, ar_values=values)
-            return capture(module, hidden_states, *args, **kwargs)
+            result = capture(module, hidden_states, *args, **kwargs)
+            if self.disk_cache is not None:
+                self.disk_cache.append(name, self.inputs.pop(name))
+            return result
 
         return forward
+
+    def make_layer_cache_hook(self, name):
+        capture = super().make_layer_cache_hook(name)
+
+        def hook(module, inputs, outputs):
+            capture(module, inputs, outputs)
+            if self.disk_cache is not None:
+                self.disk_cache.append(name, self.inputs.pop(name))
+
+        return hook
 
 
 class HunyuanPipeline(DiffusionPipeline):
@@ -293,7 +338,7 @@ def build_quantizer(model, args):
             if ".mlp.experts." in name
         )
         print("Resolved expert linear layers:", dict(expert_schemes))
-    quantizer.calibration = HunyuanCalibrator(quantizer)
+    quantizer.calibration = HunyuanCalibrator(quantizer, cache_dir=getattr(args, "calib_cache_dir", None))
     # Native Transformers checkpoint layout, not an artificial Diffusers folder.
     quantizer.save_quantized = MethodType(BaseOrchestrator.save_quantized, quantizer)
     return quantizer, originals
@@ -348,6 +393,11 @@ def parse_args():
         type=parse_layer_config_arg,
         default=None,
         help="AutoRound per-layer overrides, e.g. '{mlp.experts:{scheme:MXFP4}}'",
+    )
+    parser.add_argument(
+        "--calib-cache-dir",
+        type=Path,
+        help="Disk directory for temporary per-layer calibration snapshots; reduces CPU cache residency",
     )
     parser.add_argument("--max-memory", type=json.loads, help='Accelerate memory map, e.g. {"0":"70GiB","1":"70GiB"}')
     args = parser.parse_args()
@@ -409,9 +459,12 @@ def main():
         f"Quantizing {len(original_forwards)} decoder blocks using {args.nsamples} COCO prompts x "
         f"{args.calib_num_inference_steps} calibration steps sampled from {args.num_inference_steps} steps"
     )
-    quantizer.quantize()
-    for block, original in zip(model.model.layers, original_forwards):
-        block.forward = original
+    try:
+        quantizer.quantize()
+    finally:
+        for block, original in zip(model.model.layers, original_forwards):
+            block.forward = original
+        quantizer.calibration.close()
     quantizer.save_quantized(str(args.output), format="auto_round", inplace=True)
     copy_support_files(args.model, args.output)
     (args.output / "calibration_recipe.json").write_text(

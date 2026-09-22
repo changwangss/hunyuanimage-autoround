@@ -485,8 +485,8 @@ class TinyModel(PreTrainedModel):
         return h
 
 
-@pytest.mark.parametrize("expert_bits", [8, 4])
-def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_bits):
+@pytest.mark.parametrize("expert_bits,disk_cache", [(8, False), (4, False), (8, True), (4, True)])
+def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_bits, disk_cache):
     monkeypatch.setattr(
         "auto_round.compressors.diffusion.dataset._load_coco_dataframe",
         lambda *args: pd.DataFrame({"id": [1, 2, 3, 4], "caption": ["a cat", "a dog", "a bird", "a tree"]}),
@@ -503,6 +503,7 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
         calib_num_inference_steps=4,
         guidance_scale=5.0,
         layer_config=override,
+        calib_cache_dir=tmp_path / "cache" if disk_cache else None,
     )
     quantizer, originals = build_quantizer(model, args)
     assert quantizer.model_context.is_diffusion
@@ -512,6 +513,13 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
         if ".mlp.shared_mlp" in name or ".self_attn." in name:
             assert cfg["bits"] == cfg["act_bits"] == 8
     quantizer.quantize()
+    if disk_cache:
+        cache = quantizer.calibration.disk_cache
+        assert cache.bytes_written > 0
+        assert len(cache) == 0  # every layer was consumed by the real orchestrator
+        cache_dir = cache.directory
+        quantizer.calibration.close()
+        assert not cache_dir.exists()
     assert len(model.calls) == 4
     assert quantizer.model_context.quantized
     assert len(quantizer.calibration.summary) == 2
@@ -582,3 +590,107 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
     with compatible_cache_initialization(HunyuanStaticCache):
         output = loaded.generate_image(seed=42, generation_config=SimpleNamespace(diff_infer_steps=3))
     assert output.shape == (1, 2, 64) and torch.isfinite(output).all()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_disk_cache_roundtrip_and_cleanup(tmp_path, failure):
+    from calibration_cache import DiskCalibrationCache
+
+    cache = DiskCalibrationCache(tmp_path, shared_keys=("position_ids",))
+    folder = cache.directory
+    original = torch.arange(12).reshape(1, 3, 4).float()
+    try:
+        for index in range(3):
+            cache.append(
+                "model.layers.0",
+                {
+                    "hidden_states": [original + index],
+                    "ar_keys": [torch.empty(1, 2, 0, 4)],
+                    "ar_values": [torch.empty(1, 2, 0, 4)],
+                    "position_ids": torch.tensor([[index]]),
+                    "custom_pos_emb": [(torch.ones(1, 3, 4) * index, torch.zeros(1, 3, 4))],
+                    "use_cache": False,
+                },
+            )
+        cache.append("model.layers.1", {"hidden_states": [original]})
+        assert cache._loaded is None
+        assert list(cache) == ["model.layers.0", "model.layers.1"]
+        loaded = cache["model.layers.0"]
+        assert len(loaded["hidden_states"]) == 3
+        assert [item.item() for item in loaded["position_ids"]] == [0, 1, 2]
+        for index, tensor in enumerate(loaded["hidden_states"]):
+            torch.testing.assert_close(tensor, original + index)
+        assert cache.pop("model.layers.0") is loaded
+        assert cache._loaded is None
+        assert list(cache) == ["model.layers.1"]
+        assert cache.pop("input_ids", None) is None
+        loaded["hidden_states"][0].zero_()
+        # The mapping is private, so replay mutations cannot modify saved data.
+        saved = torch.load(folder / "model.layers.0/000000.pt", weights_only=True)
+        torch.testing.assert_close(saved["hidden_states"][0], original)
+        if failure:
+            raise RuntimeError("injected calibration failure")
+    except RuntimeError as error:
+        assert failure and str(error) == "injected calibration failure"
+    finally:
+        cache.close()
+    assert not folder.exists()
+
+
+def test_disk_cache_compacts_views_and_reports_disk_full(tmp_path, monkeypatch):
+    from calibration_cache import DiskCalibrationCache
+
+    cache = DiskCalibrationCache(tmp_path)
+    try:
+        small_view = torch.arange(1024 * 1024)[:4]
+        cache.append("layer", [small_view])
+        assert cache.bytes_written < 10000
+        torch.testing.assert_close(cache["layer"][0], small_view)
+        monkeypatch.setattr("calibration_cache.shutil.disk_usage", lambda path: SimpleNamespace(free=0))
+        with pytest.raises(RuntimeError, match="disk is full"):
+            cache.append("other", [small_view])
+    finally:
+        cache.close()
+
+
+def test_disk_and_memory_calibration_and_tuning_agree(monkeypatch, tmp_path):
+    from copy import deepcopy
+
+    monkeypatch.setattr(
+        "auto_round.compressors.diffusion.dataset._load_coco_dataframe",
+        lambda *args: pd.DataFrame({"id": [1, 2], "caption": ["a cat", "a dog"]}),
+    )
+    results = []
+    captures = []
+    for disk in (False, True):
+        torch.manual_seed(123)
+        model = TinyModel(make_config()).to("cuda:0", dtype=torch.bfloat16).eval()
+        args = SimpleNamespace(
+            image_size="1024x1024",
+            seed=42,
+            iters=2,
+            nsamples=2,
+            device="0",
+            num_inference_steps=8,
+            calib_num_inference_steps=8,
+            guidance_scale=5.0,
+            layer_config=parse_layer_config_arg("{mlp.experts:{scheme:MXFP4}}"),
+            calib_cache_dir=tmp_path / "cache" if disk else None,
+        )
+        quantizer, _ = build_quantizer(model, args)
+        original_calib = quantizer.calibration.calib
+
+        def capture(nsamples, bs):
+            original_calib(nsamples, bs)
+            # This test deliberately materializes the tiny snapshots for equality;
+            # production retains paths only until the orchestrator requests a layer.
+            captures.append(deepcopy(dict(quantizer.calibration.inputs)))
+
+        monkeypatch.setattr(quantizer.calibration, "calib", capture)
+        try:
+            quantizer.quantize()
+            results.append({name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()})
+        finally:
+            quantizer.calibration.close()
+    torch.testing.assert_close(captures[0], captures[1], rtol=0, atol=0)
+    torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
