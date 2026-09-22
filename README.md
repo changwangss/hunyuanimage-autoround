@@ -122,6 +122,33 @@ GPU budgets as quantization. This is a quality-checking path and can be slow;
 it does not measure production low-bit inference speed. Full 80B generation has
 not been validated locally.
 
+### Diagnose a gray or invalid image
+
+Add `--debug` to the same inference command. It checks each decoder block for
+NaN/Inf and records each denoising prediction, latent before/after the scheduler,
+and VAE input/output statistics. The report is written beside the image as
+`<output-stem>.debug.json`, including on generation errors. Debug checks add GPU
+synchronization and are slower. Console output also includes dependency versions,
+calibration settings (when available), and the final RGB mean and standard deviation.
+
+Keep the prompt, seed, image size, inference steps and guidance fixed for these
+comparisons, changing the output name for each run:
+
+- Normal QDQ: `--model quantized_model --debug --output outputs/qdq.png`.
+- Weight-only diagnostic: add `--disable-act-quant`, with output
+  `outputs/weight_only.png`. Saved quantized weights/scales stay unchanged; only
+  activation QDQ is bypassed. This is not a BF16 baseline or the target W8A8/W4A4 run.
+- Original-model reference: `--model /path/to/original-model --bf16 --debug
+  --output outputs/reference.png`. This uses the same native generation settings
+  and preserves the original checkpoint's mixed dtypes. It requires enough memory
+  for the original weights; `--bf16` rejects quantized checkpoints.
+
+A block/prediction failure points to a problem before VAE decoding; finite VAE
+inputs followed by invalid VAE outputs localize the failure to decoding. If
+weight-only recovers the picture, activation quantization is implicated, but this
+does not by itself distinguish QDQ implementation from quantization sensitivity.
+Short calibration is not sufficient evidence to attribute a gray image to tuning.
+
 ## Why there is an adapter
 
 AutoRound currently classifies this checkpoint as MLLM. A small DiffusionPipeline

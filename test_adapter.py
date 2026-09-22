@@ -82,6 +82,12 @@ def test_native_config_roundtrip_is_accepted_by_qdq_cli(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="reached checkpoint loader"):
         inference.main()
     loader.assert_called_once()
+    loader.reset_mock()
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--bf16"])
+    with pytest.raises(SystemExit) as error:
+        inference.main()
+    assert error.value.code == 2
+    loader.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -111,6 +117,44 @@ def native_scheduler():
     }
     exec(compile("from __future__ import annotations\n" + ast.unparse(node), str(source), "exec"), env)
     return env["FlowMatchDiscreteScheduler"](shift=3.0, reverse=True, solver="euler")
+
+
+@pytest.mark.parametrize("failure", [None, "block", "vae"])
+def test_generation_diagnostics_detect_and_restore(tmp_path, failure):
+    class VAE:
+        def decode(self, latents, **kwargs):
+            return (latents * (float("nan") if failure == "vae" else 2),)
+
+    scheduler = native_scheduler()
+    scheduler.set_timesteps(2)
+    block = nn.Identity()
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[block]), pipeline=SimpleNamespace(scheduler=scheduler), vae=VAE()
+    )
+    original_step, original_decode = scheduler.step, model.vae.decode
+    report = tmp_path / "diagnostics.json"
+
+    def run():
+        with inference.diagnose_generation(model, report):
+            hidden = torch.tensor([float("nan") if failure == "block" else 1.0])
+            block(hidden)
+            latents = scheduler.step(torch.ones(1), scheduler.timesteps[0], hidden, return_dict=False)[0]
+            model.vae.decode(latents, return_dict=False)
+
+    if failure:
+        with pytest.raises(RuntimeError, match="Non-finite values"):
+            run()
+    else:
+        run()
+    records = json.loads(report.read_text())
+    if failure:
+        assert "model.layers.0" in records[-1]["error"] if failure == "block" else "VAE output" in records[-1]["error"]
+    else:
+        assert len(records) == 5
+        assert records[0]["name"].endswith("prediction")
+        assert records[-1]["name"] == "VAE output"
+    assert scheduler.step == original_step and model.vae.decode == original_decode
+    assert not block._forward_hooks
 
 
 def test_qdq_router_preserves_native_fp32_routing():
@@ -529,6 +573,10 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
         bias = original.bias.to(x) if original.bias is not None else None
         expected = torch.nn.functional.linear(qx, weight.to(x.dtype), bias)
         torch.testing.assert_close(layer(x), expected, rtol=0, atol=0)
+        inference.set_activation_qdq(loaded, enabled=False)
+        expected_weight_only = torch.nn.functional.linear(x, weight.to(x.dtype), bias)
+        torch.testing.assert_close(layer(x), expected_weight_only, rtol=0, atol=0)
+        inference.set_activation_qdq(loaded, enabled=True)
         checked += 1
     assert checked == 10
     with compatible_cache_initialization(HunyuanStaticCache):

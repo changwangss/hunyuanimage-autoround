@@ -5,7 +5,9 @@ Validated on 2026-09-22 against AutoRound commit
 
 ## Executed checks
 
-- Twenty tests passed in `test_adapter.py`:
+- Twenty-three tests passed in `test_adapter.py`:
+  - Diagnostic hooks record denoising/VAE statistics, detect injected block/VAE
+    NaNs, and restore hooks/methods after success and errors (three cases).
   - Native Tencent config save/reload changes `model_type` from
     `hunyuan_image_3_moe` to `Hunyuan`; the QDQ CLI accepts the resulting config.
     Non-distilled, missing-distillation and unrelated Hunyuan architectures are
@@ -42,6 +44,8 @@ Validated on 2026-09-22 against AutoRound commit
   and E8M0 scales plus AutoRound activation QDQ.
   Reloaded blocks also execute three synthetic denoising steps through native
   Hunyuan SDPA attention and its static KV cache, with finite outputs.
+  The activation-bypass diagnostic agrees with weight-only reference calculations;
+  the original-model mode rejects a quantized checkpoint before loading weights.
 - Ruff lint and formatting checks passed for the Python files.
 - The CLI help command and pinned test-source SHA256 verification passed.
 
@@ -70,6 +74,9 @@ for the full model.
 - Reloading the exported full-model checkpoint in an inference engine.
 - Complete native Hunyuan QDQ generation from the exported 80B checkpoint.
 - Generated-image quality and comparison against the original model.
+- Root cause of the user-reported gray image from short smoke calibration.
+  The new diagnostics require execution on that checkpoint; local tests do not
+  establish whether its issue is numerical failure, loading, or calibration quality.
 
 The tiny-model integration tests use the published Hunyuan static cache,
 synthetic denoising inputs, a small MoE-like module, and mocked COCO captions.

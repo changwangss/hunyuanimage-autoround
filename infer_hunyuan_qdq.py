@@ -5,14 +5,97 @@ import argparse
 import json
 import sys
 from collections import Counter
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from transformers import AutoModelForCausalLM, AutoRoundConfig
 
 from auto_round.experimental.qmodules.mx import MXFP4QuantLinear, MXFP8QuantLinear
 from quantize_hunyuan_mxfp8 import compatible_cache_initialization, validate_hunyuan_config
+
+
+def set_activation_qdq(model, enabled):
+    for layer in model.modules():
+        if isinstance(layer, (MXFP4QuantLinear, MXFP8QuantLinear)):
+            layer.pre_dequantized_input = not enabled
+
+
+def check_finite(name, tensor):
+    if not torch.isfinite(tensor).all():
+        raise RuntimeError(
+            f"Non-finite values in {name} (dtype={tensor.dtype}, shape={tuple(tensor.shape)}); "
+            "stopping before image postprocessing hides the failure"
+        )
+
+
+@contextmanager
+def diagnose_generation(model, report_path=None):
+    """Trace the native denoising and VAE path without changing its calculations."""
+    if report_path is None:
+        yield
+        return
+    records = []
+
+    def record(name, tensor):
+        check_finite(name, tensor)
+        values = tensor.detach().float()
+        item = dict(
+            name=name,
+            shape=list(tensor.shape),
+            dtype=str(tensor.dtype),
+            min=values.min().item(),
+            max=values.max().item(),
+            mean=values.mean().item(),
+            std=values.std(unbiased=False).item(),
+        )
+        records.append(item)
+        print("[debug]", json.dumps(item), flush=True)
+
+    def block_hook(name):
+        def hook(module, args, output):
+            check_finite(name, output[0] if isinstance(output, tuple) else output)
+
+        return hook
+
+    scheduler = model.pipeline.scheduler
+    original_step = scheduler.step
+    original_decode = model.vae.decode
+    step_index = 0
+
+    def step(prediction, timestep, sample, *args, **kwargs):
+        nonlocal step_index
+        label = f"step {step_index}, t={float(timestep)}"
+        record(f"{label}: prediction", prediction)
+        record(f"{label}: latent before", sample)
+        result = original_step(prediction, timestep, sample, *args, **kwargs)
+        record(f"{label}: latent after", result[0] if isinstance(result, tuple) else result.prev_sample)
+        step_index += 1
+        return result
+
+    def decode(latents, *args, **kwargs):
+        record("VAE input", latents)
+        result = original_decode(latents, *args, **kwargs)
+        record("VAE output", result[0] if isinstance(result, tuple) else result.sample)
+        return result
+
+    try:
+        with ExitStack() as stack:
+            for i, block in enumerate(model.model.layers):
+                handle = block.register_forward_hook(block_hook(f"model.layers.{i} output"))
+                stack.callback(handle.remove)
+            stack.enter_context(patch.object(scheduler, "step", step))
+            stack.enter_context(patch.object(model.vae, "decode", decode))
+            yield
+    except Exception as error:
+        records.append({"error": str(error)})
+        raise
+    finally:
+        report_path = Path(report_path)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(records, indent=2))
 
 
 def preserve_router_precision(model):
@@ -93,6 +176,15 @@ def main():
     parser.add_argument("--image-size", default="1024x1024")
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--debug", action="store_true", help="Check block finiteness and save denoising/VAE statistics")
+    parser.add_argument(
+        "--disable-act-quant", action="store_true", help="Diagnostic: keep saved weights but bypass activation QDQ"
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Reference run from the original unquantized checkpoint, preserving native mixed dtypes",
+    )
     parser.add_argument("--max-memory", type=json.loads, help='GPU memory budgets, e.g. {"0":"70GiB","1":"70GiB"}')
     args = parser.parse_args()
     args.model = args.model.resolve()
@@ -106,26 +198,81 @@ def main():
     except ValueError as error:
         parser.error(str(error))
     quant_config = config.get("quantization_config", {})
-    if quant_config.get("quant_method") != "auto-round" or quant_config.get("data_type") != "mx_fp":
+    if args.bf16 and (quant_config or args.disable_act_quant):
+        parser.error(
+            "--bf16 requires the original unquantized checkpoint and cannot be combined with --disable-act-quant"
+        )
+    if not args.bf16 and (quant_config.get("quant_method") != "auto-round" or quant_config.get("data_type") != "mx_fp"):
         parser.error("Expected the AutoRound MXFP checkpoint exported by quantize_hunyuan_mxfp8.py")
     max_memory = None
     if args.max_memory:
         max_memory = {int(k) if k.isdigit() else k: v for k, v in args.max_memory.items()}
-    model = load_qdq_model(
-        args.model, max_memory=max_memory, attn_implementation="sdpa", moe_impl="eager", moe_drop_tokens=True
-    )
+    if args.bf16:
+        model = AutoModelForCausalLM.from_pretrained(
+            str(args.model),
+            local_files_only=True,
+            trust_remote_code=True,
+            torch_dtype="auto",
+            device_map="auto",
+            max_memory=max_memory,
+            attn_implementation="sdpa",
+            moe_impl="eager",
+            moe_drop_tokens=True,
+        ).eval()
+    else:
+        model = load_qdq_model(
+            args.model, max_memory=max_memory, attn_implementation="sdpa", moe_impl="eager", moe_drop_tokens=True
+        )
+    if args.disable_act_quant:
+        set_activation_qdq(model, enabled=False)
+        print("Activation QDQ disabled for diagnosis; saved quantized weights are unchanged.")
     if not hasattr(model.config, "model_version"):
         model.config.model_version = "HunyuanImage-3.0-Instruct"
     model.load_tokenizer(str(args.model))
-    image = generate_image(
-        model, args.prompt, args.num_inference_steps, args.guidance_scale, args.image_size, args.seed
-    )
+    if args.debug:
+        import auto_round
+        import transformers
+
+        print(
+            "[debug] Versions:",
+            {
+                "torch": torch.__version__,
+                "transformers": transformers.__version__,
+                "auto_round": auto_round.__version__,
+                "auto_round_path": auto_round.__file__,
+            },
+        )
+        print("[debug] Inference settings:", json.dumps(vars(args), default=str))
+        recipe_path = args.model / "calibration_recipe.json"
+        if recipe_path.exists():
+            recipe = json.loads(recipe_path.read_text())
+            print(
+                "[debug] Calibration settings:",
+                {
+                    key: recipe.get(key)
+                    for key in (
+                        "nsamples",
+                        "iters",
+                        "num_inference_steps",
+                        "calib_num_inference_steps",
+                        "image_size",
+                        "guidance_scale",
+                    )
+                },
+            )
+    with diagnose_generation(model, args.output.with_suffix(".debug.json") if args.debug else None):
+        image = generate_image(
+            model, args.prompt, args.num_inference_steps, args.guidance_scale, args.image_size, args.seed
+        )
+    if args.debug:
+        from PIL import ImageStat
+
+        stats = ImageStat.Stat(image.convert("RGB"))
+        print("[debug] Image RGB mean/std:", stats.mean, stats.stddev)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     image.save(args.output)
     args.output.with_suffix(".json").write_text(json.dumps(vars(args), default=str, indent=2))
-    print(
-        f"Saved {args.output}. QDQ uses floating-point matmul; this is a quality check, not a low-bit speed benchmark."
-    )
+    print(f"Saved {args.output}.")
 
 
 if __name__ == "__main__":
