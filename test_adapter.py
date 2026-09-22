@@ -3,6 +3,7 @@
 import ast
 import json
 import re
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -13,12 +14,16 @@ import torch
 from torch import nn
 from transformers import LlamaConfig, PreTrainedModel
 from transformers.cache_utils import StaticCache
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.schedulers.scheduling_utils import SchedulerMixin
 
 from quantize_hunyuan_mxfp8 import (
     HunyuanPipeline,
     build_quantizer,
+    calibration_schedule,
     compatible_cache_initialization,
     install_replay_forward,
+    parse_args,
 )
 from auto_round.utils import parse_layer_config_arg
 
@@ -46,6 +51,78 @@ def native_cache_class():
 HunyuanStaticCache = native_cache_class()
 
 
+def native_scheduler():
+    source = Path(__file__).parent / "reference/hunyuan_image_3_pipeline.py"
+    tree = ast.parse(source.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "FlowMatchDiscreteScheduler")
+    env = {
+        "torch": torch,
+        "SchedulerMixin": SchedulerMixin,
+        "ConfigMixin": ConfigMixin,
+        "register_to_config": register_to_config,
+    }
+    exec(compile("from __future__ import annotations\n" + ast.unparse(node), str(source), "exec"), env)
+    return env["FlowMatchDiscreteScheduler"](shift=3.0, reverse=True, solver="euler")
+
+
+@pytest.mark.parametrize("calib_steps", [1, 2, 4, 8])
+def test_native_scheduler_subset_and_meanflow(calib_steps):
+    original = native_scheduler()
+    original.set_timesteps(8)
+    pipe = SimpleNamespace(scheduler=original)
+    selections = []
+    for seed in [42, 42, 43]:
+        with calibration_schedule(pipe, calib_steps, seed) as record:
+            scheduler = pipe.scheduler
+            scheduler.set_timesteps(8)
+            indices = record["indices"]
+            assert len(indices) == len(set(indices)) == calib_steps
+            assert indices == sorted(indices) and indices[0] == 0
+            if calib_steps > 1:
+                assert indices[-1] == 7
+            torch.testing.assert_close(scheduler.timesteps, original.timesteps[indices])
+            torch.testing.assert_close(scheduler.sigmas, original.sigmas[indices + [8]])
+            sample = torch.ones(1)
+            for i, timestep in enumerate(scheduler.timesteps):
+                next_time = scheduler.get_timestep_r(timestep)
+                torch.testing.assert_close(next_time, scheduler.sigmas[i + 1] * 1000)
+                sample = scheduler.step(torch.ones(1), timestep, sample, return_dict=False)[0]
+            torch.testing.assert_close(sample, torch.zeros(1))
+            selections.append(indices)
+        assert pipe.scheduler is original
+        assert original.step_index is None
+        assert len(original.timesteps) == 8
+    assert selections[0] == selections[1]
+    if calib_steps == 4:
+        assert selections[0] != selections[2]
+    with pytest.raises(RuntimeError, match="generation failed"):
+        with calibration_schedule(pipe, calib_steps, 42):
+            pipe.scheduler.set_timesteps(8)
+            raise RuntimeError("generation failed")
+    assert pipe.scheduler is original
+
+
+@pytest.mark.parametrize(
+    "options,expected",
+    [
+        (["--num_inference_steps", "8", "--calib_num_inference_steps", "4"], (8, 4)),
+        (["--steps", "4"], (4, 4)),
+        (["--num_inference_steps", "4", "--calib_num_inference_steps", "8"], None),
+    ],
+)
+def test_cli_step_options(monkeypatch, tmp_path, options, expected):
+    monkeypatch.setattr(
+        sys, "argv", ["quantize", "--model", str(tmp_path / "model"), "--output", str(tmp_path / "out"), *options]
+    )
+    if expected is None:
+        with pytest.raises(SystemExit) as error:
+            parse_args()
+        assert error.value.code == 2
+    else:
+        args = parse_args()
+        assert (args.num_inference_steps, args.calib_num_inference_steps) == expected
+
+
 @pytest.mark.parametrize("steps", [3, 8])
 def test_adapter_passes_options_to_native_generation(monkeypatch, steps):
     source = Path(__file__).parent / "reference/modeling_hunyuan_image_3.py"
@@ -59,6 +136,13 @@ def test_adapter_passes_options_to_native_generation(monkeypatch, steps):
     model.config.cfg_distilled = True
     model._tokenizer = SimpleNamespace(encode=lambda text: [9])
     model.pipeline = Mock(return_value=[None])
+    model.pipeline.scheduler = native_scheduler()
+
+    def run_pipeline(**kwargs):
+        model.pipeline.scheduler.set_timesteps(kwargs["num_inference_steps"])
+        return [None]
+
+    model.pipeline.side_effect = run_pipeline
     info = SimpleNamespace(
         image_token_length=2,
         add_timestep_token=True,
@@ -80,7 +164,7 @@ def test_adapter_passes_options_to_native_generation(monkeypatch, steps):
 
     monkeypatch.setattr(model, "generate_image", generate_image)
     original_config = model.generation_config
-    HunyuanPipeline(model)(["a cat", "a dog"], num_inference_steps=steps, guidance_scale=5.0)
+    HunyuanPipeline(model, num_inference_steps=steps)(["a cat", "a dog"], num_inference_steps=steps, guidance_scale=5.0)
     assert model.pipeline.call_count == 2
     for call in model.pipeline.call_args_list:
         assert call.kwargs["num_inference_steps"] == steps
@@ -230,13 +314,15 @@ class TinyModel(PreTrainedModel):
         self.model.embed_tokens = nn.Embedding(32, config.hidden_size)
         self.calls = []
         self.generation_config = SimpleNamespace(diff_infer_steps=8, diff_guidance_scale=2.5)
+        self.pipeline = SimpleNamespace(scheduler=native_scheduler())
 
     def generate_image(self, **kwargs):
         self.calls.append(kwargs)
         generator = torch.Generator(device=self.device).manual_seed(kwargs["seed"])
         cache = HunyuanStaticCache(config=self.config, max_cache_len=5, dynamic=False)
         gen_config = kwargs.get("generation_config", self.generation_config)
-        for step in range(gen_config.diff_infer_steps):
+        self.pipeline.scheduler.set_timesteps(gen_config.diff_infer_steps)
+        for step, _ in enumerate(self.pipeline.scheduler.timesteps):
             length = 5 if step == 0 else 2
             h = torch.randn(1, length, 64, device=self.device, dtype=self.dtype, generator=generator)
             positions = (
@@ -256,7 +342,7 @@ class TinyModel(PreTrainedModel):
 def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_bits):
     monkeypatch.setattr(
         "auto_round.compressors.diffusion.dataset._load_coco_dataframe",
-        lambda *args: pd.DataFrame({"id": [1, 2], "caption": ["a cat", "a dog"]}),
+        lambda *args: pd.DataFrame({"id": [1, 2, 3, 4], "caption": ["a cat", "a dog", "a bird", "a tree"]}),
     )
     model = TinyModel(make_config()).to("cuda:0", dtype=torch.bfloat16).eval()
     override = parse_layer_config_arg("{mlp.experts:{scheme:MXFP4}}") if expert_bits == 4 else None
@@ -264,9 +350,10 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
         image_size="1024x1024",
         seed=42,
         iters=2,
-        nsamples=2,
+        nsamples=4,
         device="0",
-        steps=3,
+        num_inference_steps=8,
+        calib_num_inference_steps=4,
         guidance_scale=5.0,
         layer_config=override,
     )
@@ -278,10 +365,13 @@ def test_actual_autoround_mxfp8_tuning_and_export(monkeypatch, tmp_path, expert_
         if ".mlp.shared_mlp" in name or ".self_attn." in name:
             assert cfg["bits"] == cfg["act_bits"] == 8
     quantizer.quantize()
-    assert len(model.calls) == 2
+    assert len(model.calls) == 4
     assert quantizer.model_context.quantized
     assert len(quantizer.calibration.summary) == 2
-    assert all(item["sequence_lengths"] == [5, 2, 2, 5, 2, 2] for item in quantizer.calibration.summary.values())
+    assert all(item["sequence_lengths"] == [5, 2, 2, 2] * 4 for item in quantizer.calibration.summary.values())
+    assert all(item["forwards"] == 16 for item in quantizer.calibration.summary.values())
+    assert len(quantizer.pipe.calibration_schedules) == 4
+    assert all(len(record["indices"]) == 4 for record in quantizer.pipe.calibration_schedules)
     assert quantizer.scheme_context.bits == quantizer.scheme_context.act_bits == 8
     for block, original in zip(model.model.layers, originals):
         block.forward = original

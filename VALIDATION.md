@@ -5,7 +5,12 @@ Validated on 2026-09-22 against AutoRound commit
 
 ## Executed checks
 
-- Seven tests passed in `test_adapter.py`:
+- Fourteen tests passed in `test_adapter.py`:
+  - Native Tencent Euler scheduler subsets of 1, 2, 4 and all 8 steps: timestep
+    membership/order, sigma alignment, MeanFlow next-time conditioning, Euler
+    updates, seeded reproducibility and scheduler restoration after exceptions.
+  - Explicit CLI step counts, legacy `--steps`, and rejection of a calibration
+    budget larger than the full schedule (three cases).
   - Tencent's published image-generation dispatch receives the requested step
     count (3 and 8) and guidance through the adapter, without changing the
     model's default generation config. Tokenization and the image pipeline are
@@ -20,6 +25,8 @@ Validated on 2026-09-22 against AutoRound commit
 - The export tests check the resolved expert/shared-MLP/attention schemes,
   per-layer calibration forward counts and sequence lengths, serialized
   quantization settings, and expert weight packing dtype/shape.
+  Each runs four prompts with four steps selected from an eight-step schedule,
+  verifying exactly 16 cached forwards per decoder block.
 - Ruff lint and formatting checks passed for the Python files.
 - The CLI help command and pinned test-source SHA256 verification passed.
 

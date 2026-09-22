@@ -21,7 +21,7 @@ Start with a small smoke run:
 python quantize_hunyuan_mxfp8.py \
   --model /path/to/HunyuanImage-3-Instruct-Distil \
   --output /path/to/HunyuanImage-3-Instruct-Distil-MXFP8-smoke \
-  --nsamples 1 --steps 8 --iters 2
+  --nsamples 1 --num_inference_steps 8 --calib_num_inference_steps 4 --iters 2
 ```
 
 Then use a separate output directory for tuning:
@@ -30,7 +30,7 @@ Then use a separate output directory for tuning:
 python quantize_hunyuan_mxfp8.py \
   --model /path/to/HunyuanImage-3-Instruct-Distil \
   --output /path/to/HunyuanImage-3-Instruct-Distil-MXFP8 \
-  --nsamples 8 --steps 8 --iters 200 \
+  --nsamples 8 --num_inference_steps 8 --calib_num_inference_steps 4 --iters 200 \
   --layer_config '{mlp.experts:{scheme:MXFP4}}' \
   --image-size 1024x1024 --device 0
 ```
@@ -40,8 +40,26 @@ attention and the shared MLP retain MXFP8 (W8A8). Omit it for uniform MXFP8.
 The equivalent Python API argument is
 `layer_config={"mlp.experts": {"scheme": "MXFP4"}}`.
 
-`--nsamples` counts COCO captions, not denoising steps. Eight captions and eight
-steps yield 64 calibration forwards per decoder block. This is a starting recipe,
+`--num_inference_steps` defines the full native timestep schedule (default: 8).
+`--calib_num_inference_steps` selects how many of those steps are actually executed
+and cached per prompt (default: all). For example, 8 and 4 build an eight-step
+schedule and run four selected steps. This does not execute all eight steps or
+rebuild a new four-step schedule. The resulting latent trajectory differs from
+full eight-step generation.
+
+Sampling preserves the first and last timesteps and chooses one step from each
+interior stratum, with seed `--seed + prompt_index`. A one-step budget uses only
+the first timestep. The selected sigmas and MeanFlow next-time conditioning are
+updated together. The full schedule and model defaults are preserved outside the
+call. Selected indices, timesteps and seeds are saved in `calibration_recipe.json`.
+Tencent's native progress bar may still display the full schedule length.
+
+Both options also accept hyphenated names. The legacy `--steps N` sets both counts
+to N and cannot be combined with either explicit option. Calibration steps must
+be positive and no greater than the full schedule length.
+
+`--nsamples` counts COCO captions, not denoising steps. Four captions with four
+selected steps yield 16 calibration forwards per decoder block. This is a starting recipe,
 not a measured quality recommendation. The script uses direct text-to-image
 generation (`bot_task="image"`), not CoT, prompt rewriting, or image editing.
 

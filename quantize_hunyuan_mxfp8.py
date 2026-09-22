@@ -43,6 +43,44 @@ def compatible_cache_initialization(cache_class):
         yield
 
 
+@contextmanager
+def calibration_schedule(pipe, calib_steps, seed):
+    """Run a seeded subset of the native schedule on an isolated scheduler."""
+    scheduler = deepcopy(pipe.scheduler)
+    if scheduler.config.solver != "euler":
+        raise ValueError("Calibration timestep sampling requires Hunyuan's Euler scheduler.")
+    original_set_timesteps = scheduler.set_timesteps
+    schedule = {}
+
+    def set_timesteps(*args, **kwargs):
+        original_set_timesteps(*args, **kwargs)
+        total = len(scheduler.timesteps)
+        if not 1 <= calib_steps <= total:
+            raise ValueError(f"calib_num_inference_steps must be between 1 and num_inference_steps ({total})")
+        if calib_steps == total:
+            indices = list(range(total))
+        elif calib_steps == 1:
+            indices = [0]
+        else:
+            # Keep both ends; sample once per disjoint interior stratum.
+            rng = torch.Generator().manual_seed(seed)
+            indices = [0]
+            for i in range(calib_steps - 2):
+                start = 1 + i * (total - 2) // (calib_steps - 2)
+                end = 1 + (i + 1) * (total - 2) // (calib_steps - 2)
+                indices.append(torch.randint(start, end, (), generator=rng).item())
+            indices.append(total - 1)
+        # MeanFlow uses timesteps_full for the next-time conditioning token.
+        scheduler.timesteps = scheduler.timesteps[indices]
+        scheduler.timesteps_full = scheduler.timesteps_full[indices + [total]]
+        scheduler.sigmas = scheduler.sigmas[indices + [total]]
+        scheduler.num_inference_steps = calib_steps
+        schedule.update(indices=indices, timesteps=scheduler.timesteps.cpu().tolist(), seed=seed)
+
+    with patch.object(scheduler, "set_timesteps", set_timesteps), patch.object(pipe, "scheduler", scheduler):
+        yield schedule
+
+
 class ReplayCache:
     """Replay one layer's static KV state without mutating saved calibration data."""
 
@@ -143,12 +181,14 @@ class HunyuanCalibrator(DiffusionCalibrator):
 class HunyuanPipeline(DiffusionPipeline):
     """Route AutoRound to diffusion calibration using the native generation API."""
 
-    def __init__(self, transformer, image_size="1024x1024", seed=42):
+    def __init__(self, transformer, image_size="1024x1024", seed=42, num_inference_steps=8):
         super().__init__()
         self.register_modules(transformer=transformer)
         self.image_size = image_size
         self.seed = seed
         self.prompt_count = 0
+        self.num_inference_steps = num_inference_steps
+        self.calibration_schedules = []
 
     @property
     def device(self):
@@ -164,23 +204,28 @@ class HunyuanPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(self, prompt, guidance_scale=5.0, num_inference_steps=8, generator=None):
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+        # AutoRound passes its calibration budget as the pipeline call's step count.
+        calib_steps = num_inference_steps
         # Native gen_image reads these from generation_config, not loose kwargs.
         generation_config = deepcopy(self.transformer.generation_config)
-        generation_config.diff_infer_steps = num_inference_steps
+        generation_config.diff_infer_steps = self.num_inference_steps
         generation_config.diff_guidance_scale = guidance_scale
         model_module = sys.modules[type(self.transformer).__module__]
         with compatible_cache_initialization(model_module.HunyuanStaticCache):
             for text in prompts:
-                self.transformer.generate_image(
-                    prompt=text,
-                    seed=self.seed + self.prompt_count,
-                    image_size=self.image_size,
-                    bot_task="image",
-                    use_system_prompt="en_unified",
-                    generation_config=generation_config,
-                    use_taylor_cache=False,
-                    verbose=0,
-                )
+                seed = self.seed + self.prompt_count
+                with calibration_schedule(self.transformer.pipeline, calib_steps, seed) as schedule:
+                    self.transformer.generate_image(
+                        prompt=text,
+                        seed=seed,
+                        image_size=self.image_size,
+                        bot_task="image",
+                        use_system_prompt="en_unified",
+                        generation_config=generation_config,
+                        use_taylor_cache=False,
+                        verbose=0,
+                    )
+                self.calibration_schedules.append(schedule)
                 self.prompt_count += 1
 
 
@@ -188,7 +233,9 @@ def build_quantizer(model, args):
     blocks = list(model.model.layers)
     block_groups = [[f"model.layers.{i}"] for i in range(len(blocks))]
     originals = [install_replay_forward(block) for block in blocks]
-    pipe = HunyuanPipeline(model, image_size=args.image_size, seed=args.seed)
+    pipe = HunyuanPipeline(
+        model, image_size=args.image_size, seed=args.seed, num_inference_steps=args.num_inference_steps
+    )
 
     def load_adapter(candidate, **kwargs):
         if candidate is not pipe:
@@ -219,7 +266,8 @@ def build_quantizer(model, args):
             low_cpu_mem_usage=False,
             enable_torch_compile=False,
             seed=args.seed,
-            calib_num_inference_steps=args.steps,
+            num_inference_steps=args.num_inference_steps,
+            calib_num_inference_steps=args.calib_num_inference_steps,
             guidance_scale=args.guidance_scale,
         )
     quantizer.post_init()
@@ -256,10 +304,22 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path, help="Downloaded Tencent native checkpoint directory")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--nsamples", type=int, default=8, help="Number of COCO prompts")
     parser.add_argument(
-        "--nsamples", type=int, default=8, help="COCO prompts; each produces --steps calibration forwards"
+        "--num_inference_steps",
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Full native denoising schedule length (default: 8)",
     )
-    parser.add_argument("--steps", type=int, default=8)
+    parser.add_argument(
+        "--calib_num_inference_steps",
+        "--calib-num-inference-steps",
+        type=int,
+        default=None,
+        help="Steps sampled and executed per prompt (default: full schedule)",
+    )
+    parser.add_argument("--steps", type=int, default=None, help="Legacy shorthand setting both step counts")
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument(
         "--image-size", default="1024x1024", help="Fixed size avoids autoregressive aspect-ratio generation"
@@ -276,8 +336,19 @@ def parse_args():
     )
     parser.add_argument("--max-memory", type=json.loads, help='Accelerate memory map, e.g. {"0":"70GiB","1":"70GiB"}')
     args = parser.parse_args()
-    if min(args.nsamples, args.steps, args.iters) < 1:
+    if args.steps is not None:
+        if args.num_inference_steps is not None or args.calib_num_inference_steps is not None:
+            parser.error("Use --steps alone or the two explicit step options, not both")
+        args.num_inference_steps = args.calib_num_inference_steps = args.steps
+    if args.num_inference_steps is None:
+        args.num_inference_steps = 8
+    if args.calib_num_inference_steps is None:
+        args.calib_num_inference_steps = args.num_inference_steps
+    del args.steps
+    if min(args.nsamples, args.num_inference_steps, args.calib_num_inference_steps, args.iters) < 1:
         parser.error("nsamples, steps and iters must be positive; this script performs calibrated tuning")
+    if args.calib_num_inference_steps > args.num_inference_steps:
+        parser.error("calib_num_inference_steps must not exceed num_inference_steps")
     if args.image_size == "auto":
         parser.error("Use a fixed image size, e.g. 1024x1024")
     args.model = args.model.resolve()
@@ -320,7 +391,10 @@ def main():
         model.config.model_version = "HunyuanImage-3.0-Instruct"
     model.load_tokenizer(str(args.model))
     quantizer, original_forwards = build_quantizer(model, args)
-    print(f"Quantizing {len(original_forwards)} decoder blocks using {args.nsamples} COCO prompts x {args.steps} steps")
+    print(
+        f"Quantizing {len(original_forwards)} decoder blocks using {args.nsamples} COCO prompts x "
+        f"{args.calib_num_inference_steps} calibration steps sampled from {args.num_inference_steps} steps"
+    )
     quantizer.quantize()
     for block, original in zip(model.model.layers, original_forwards):
         block.forward = original
@@ -335,6 +409,7 @@ def main():
                 "dataset": "coco2014",
                 "bot_task": "image",
                 "calibration": quantizer.calibration.summary,
+                "calibration_schedules": quantizer.pipe.calibration_schedules,
             },
             default=str,
             indent=2,
