@@ -747,3 +747,78 @@ def test_disk_cache_deduplicates_equal_auxiliaries_without_aliasing(tmp_path):
         assert len(list((cache.directory / "shared").glob("*.pt"))) == 3
     finally:
         cache.close()
+
+
+@pytest.mark.parametrize("disk", [False, True])
+@pytest.mark.parametrize("calib_steps", [1, 4, 8])
+def test_chained_blocks_match_independent_blocks(monkeypatch, tmp_path, disk, calib_steps):
+    from copy import deepcopy
+    from calibration_cache import tensor_bytes
+
+    monkeypatch.setattr(
+        "auto_round.compressors.diffusion.dataset._load_coco_dataframe",
+        lambda *args: pd.DataFrame({"id": [1, 2], "caption": ["a cat", "a dog"]}),
+    )
+    snapshots, replay_inputs, weights, sizes = [], [], [], []
+    for chained in (False, True):
+        torch.manual_seed(123)
+        model = TinyModel(make_config()).to("cuda:0", dtype=torch.bfloat16).eval()
+        args = SimpleNamespace(
+            image_size="1024x1024",
+            seed=42,
+            iters=2,
+            nsamples=2,
+            device="0",
+            num_inference_steps=8,
+            calib_num_inference_steps=calib_steps,
+            guidance_scale=5.0,
+            layer_config=parse_layer_config_arg("{mlp.experts:{scheme:MXFP4}}"),
+            calib_cache_dir=tmp_path / "cache" if disk else None,
+        )
+        quantizer, _ = build_quantizer(model, args)
+        if not chained:
+            # Reproduce the previously shipped independent-layer organization.
+            quantizer.quant_block_list = [[f"model.layers.{i}"] for i in range(2)]
+            quantizer.has_variable_block_shape = False
+            quantizer.calibration.has_variable_block_shape = False
+        original_calib = quantizer.calibration.calib
+        original_compress = quantizer.alg_composer.compress_block
+        observed = {}
+
+        def capture(nsamples, bs):
+            original_calib(nsamples, bs)
+            snapshots.append(deepcopy(dict(quantizer.calibration.inputs)))
+            if disk:
+                sizes.append(quantizer.calibration.disk_cache.bytes_written)
+
+        def compress(block, fp_inputs, input_others, **kwargs):
+            observed[kwargs["block_ctx"].block_name] = deepcopy(fp_inputs)
+            return original_compress(block, fp_inputs, input_others, **kwargs)
+
+        monkeypatch.setattr(quantizer.calibration, "calib", capture)
+        monkeypatch.setattr(quantizer.alg_composer, "compress_block", compress)
+        try:
+            quantizer.quantize()
+            replay_inputs.append(observed)
+            weights.append({key: value.detach().cpu().clone() for key, value in model.state_dict().items()})
+            if disk:
+                assert len(quantizer.calibration.disk_cache) == 0
+        finally:
+            quantizer.calibration.close()
+    assert "hidden_states" in snapshots[1]["model.layers.0"]
+    assert "hidden_states" not in snapshots[1]["model.layers.1"]
+    baseline_hidden = sum(tensor_bytes(value.get("hidden_states")) for value in snapshots[0].values())
+    chained_hidden = sum(tensor_bytes(value.get("hidden_states")) for value in snapshots[1].values())
+    assert chained_hidden * 2 == baseline_hidden
+    for name, baseline in snapshots[0].items():
+        for key, value in baseline.items():
+            if key != "hidden_states":
+                torch.testing.assert_close(value, snapshots[1][name][key], rtol=0, atol=0)
+        # AutoRound must pass the preceding full-precision reference output,
+        # using this layer's own KV context rather than the preceding layer's.
+        actual = replay_inputs[1][name]
+        actual = actual["hidden_states"] if isinstance(actual, dict) else actual
+        torch.testing.assert_close(actual, baseline["hidden_states"], rtol=0, atol=0, check_device=False)
+    torch.testing.assert_close(weights[0], weights[1], rtol=0, atol=0)
+    if disk:
+        assert sizes[1] < sizes[0]

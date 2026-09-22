@@ -57,7 +57,6 @@ class DiskCalibrationCache(Mapping):
         self.directory = Path(self._temporary.name)
         self.shared_keys = shared_keys
         self.files = {}
-        self.summary = {}
         self.bytes_written = 0
         self.payload_bytes_by_field = Counter()
         self.logical_bytes_by_field = Counter()
@@ -130,11 +129,6 @@ class DiskCalibrationCache(Mapping):
         torch.save(stored, path)
         self.bytes_written += path.stat().st_size
         paths.append(path)
-        if isinstance(inputs, dict) and "hidden_states" in inputs:
-            info = self.summary.setdefault(name, {"forwards": 0, "kv_forwards": 0, "sequence_lengths": []})
-            info["forwards"] += len(inputs["hidden_states"])
-            info["kv_forwards"] += len(inputs.get("ar_keys", []))
-            info["sequence_lengths"].extend(tensor.shape[1] for tensor in inputs["hidden_states"])
 
     def __getitem__(self, name):
         paths = self.files[name]

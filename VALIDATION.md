@@ -5,7 +5,7 @@ Validated on 2026-09-22 against AutoRound commit
 
 ## Executed checks
 
-- Thirty-one tests passed in `test_adapter.py`:
+- Thirty-seven tests passed in `test_adapter.py`:
   - Diagnostic hooks record denoising/VAE statistics, detect injected block/VAE
     NaNs, and restore hooks/methods after success and errors (three cases).
   - Native Tencent config save/reload changes `model_type` from
@@ -40,6 +40,13 @@ Validated on 2026-09-22 against AutoRound commit
 - A separate two-prompt, full-eight-step comparison verifies exact equality of
   all non-KV cached inputs, the retained KV positions, and final tuned state
   dictionaries between full-memory and compact/deduplicated disk paths.
+- Six sequential-block regression cases compare the previous independent-layer
+  groups against one chained group, in memory and disk modes, with 1, 4 and 8
+  calibration steps selected from an eight-step schedule. They use two prompts,
+  native Hunyuan attention/KV replay, and real mixed MXFP8/MXFP4 tuning. Every
+  layer's replay hidden states and final tuned state dictionaries match exactly
+  (`rtol=0, atol=0`); per-layer auxiliary snapshots also match exactly. Only the
+  first layer retains captured hidden states, and disk files are all consumed.
 - Native Hunyuan SDPA replay checks cover both full and compact KV, including
   repeated replay and backward gradients. Tensor deduplication checks identical
   content across layers/steps, dtype/shape distinctions, and mutation isolation.
@@ -81,18 +88,21 @@ The probe contains no full-model weights and is not a measurement of the user's
 
 A separate synthetic CPU probe used four layers, eight steps, hidden width 4096,
 512 updated tokens plus 128 context tokens, 8 KV heads of width 128 and BF16
-floating tensors. It compared the previous full-snapshot encoding with the new
-compact-KV and auxiliary-tensor deduplication:
+floating tensors. It compared the original full-snapshot encoding, compact KV
+with auxiliary-tensor deduplication, and the new sequential-block organization:
 
 | Encoding | Serialized files |
 | --- | ---: |
 | Full snapshots | 220.78 MiB |
 | Compact KV + deduplication | 135.39 MiB |
+| Compact KV + deduplication + sequential blocks | 36.38 MiB |
 
-This reduced serialized bytes by 38.7%. The remaining tensor payload was dominated
-by 132 MiB of distinct hidden states. The probe uses synthetic tensors and a much
-shorter sequence than the real 1024x1024 model; it does not predict the full-run
-saving or establish a new container-memory peak.
+The first optimization reduced serialized bytes by 38.7%. Sequential blocks
+reduce that compact format by a further 73.1%, keeping 33 MiB of first-layer
+hidden states instead of 132 MiB across four layers. Other tensor payload sizes
+are unchanged. The probe uses synthetic tensors and a much shorter sequence than
+the real 1024x1024 model; it does not predict the full-run saving or establish a
+new container-memory peak.
 
 ## Environment
 

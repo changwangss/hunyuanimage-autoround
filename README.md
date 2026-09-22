@@ -85,8 +85,9 @@ python quantize_hunyuan_mxfp8.py \
   --calib-cache-dir /path/to/large-disk/calibration-cache
 ```
 
-Without this option, calibration stores all layers' inputs and per-step KV
-snapshots in CPU memory. AutoRound then moves the full unquantized model to CPU
+Without this option, calibration stores the first layer's hidden states and all
+layers' auxiliary inputs, including per-step KV snapshots, in CPU memory.
+AutoRound then moves the full unquantized model to CPU
 before tuning, so both allocations coexist. A container can exceed its CPU memory
 limit at this transition even when GPU calibration succeeds.
 
@@ -98,8 +99,13 @@ freshly computed KV. Text/context KV, attention masks, position IDs and rotary
 embeddings are stored once when dtype, shape and tensor bytes match exactly.
 Deduplication compares content; it does not assume those tensors are constant.
 Each loaded reference uses a separate private mapping so in-place writes cannot
-corrupt another sample. Hidden states retain their original dtype and remain
-per-layer/per-step. Calibration steps and quantization settings do not change. Small tensor views are compacted before
+corrupt another sample. Only the first decoder layer's hidden states are cached,
+with their original dtype. AutoRound's block runner computes full-precision
+reference outputs and its orchestrator passes them to the next layer. Each layer
+receives its own saved KV and auxiliary inputs through AutoRound's existing
+per-layer input interface. This also avoids saving later layers' hidden states in
+memory mode. Calibration steps and quantization settings do not change.
+Small tensor views are compacted before
 writing, avoiding serialization of their entire backing storage. Each run creates
 its own `hunyuan-calib-*` subdirectory; the script removes it when quantization
 finishes or raises an exception, before exporting. A forced kill/container restart
@@ -118,8 +124,10 @@ still participate in the OS/container memory accounting and may be reclaimed.
 The previous version (`7f1ab9b`) wrote full KV and repeated auxiliary tensors.
 The user observed 143G after five 1024x1024 prompts; that is roughly 915G for
 32 prompts at the same rate. The new compact/deduplicated format reduces these
-redundancies, but does not guarantee a small cache: distinct hidden states still
-scale with prompts × steps × layers. Start with one full-eight-step prompt to
+redundancies. Sequential block replay additionally removes later layers' hidden
+states: that part now scales with prompts × steps, without the layer multiplier.
+Per-layer KV is still needed, so this does not guarantee a small total cache.
+Start with one full-eight-step prompt to
 measure the new format before budgeting a 32-prompt run. Existing cache files are
 not converted; start a fresh run with the updated script.
 
@@ -223,9 +231,12 @@ files are modified.
 Hunyuan's later denoising steps reuse per-layer text KV state. The stock generic
 calibration collector drops the custom cache object. This script captures each
 layer's KV tensors before its forward, and reconstructs the static-cache update
-for replay. Every replay uses fresh tensors and supports gradients. Each decoder
-layer has its own calibration group, so another layer's KV state cannot be reused
-accidentally. Taylor cache is disabled so every denoising step executes.
+for replay. Every replay uses fresh tensors and supports gradients. All decoder
+layers form one calibration group. AutoRound's per-layer auxiliary-input path
+(`has_variable_block_shape`) switches KV, masks and positions at each layer;
+only the first layer is marked as needing captured hidden states. The ordinary
+block runner and sequential quantization loop remain unchanged. Taylor cache is
+disabled so every selected denoising step executes.
 
 ## Validation boundary
 

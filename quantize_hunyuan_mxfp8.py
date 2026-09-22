@@ -190,14 +190,27 @@ class HunyuanCalibrator(DiffusionCalibrator):
     def calib(self, nsamples, bs):
         self.prompt_count = 0
         self.requested_nsamples = nsamples
-        super().calib(nsamples, bs)
         self.summary = {}
+        if self.has_variable_block_shape:
+            # AutoRound captures every layer's kwargs, but chains reference
+            # outputs between layers. Only the group entry needs hidden states.
+            self.blocks_requiring_input_ids = ["model.layers.0"]
+        super().calib(nsamples, bs)
+        expected = nsamples * self.calib_num_inference_steps
+        for name in self.to_cached_layers:
+            if not name.startswith("model.layers."):
+                continue
+            info = self.summary.get(name, {})
+            if info.get("forwards") != expected:
+                raise RuntimeError(f"{name}: expected {expected} forwards, got {info}")
+            saved = (
+                len(self.disk_cache.files.get(name, []))
+                if self.disk_cache is not None
+                else len(self.inputs[name].get("ar_keys", []))
+            )
+            if saved != expected:
+                raise RuntimeError(f"{name}: missing per-step KV snapshots")
         if self.disk_cache is not None:
-            expected = nsamples * self.calib_num_inference_steps
-            for name, info in self.disk_cache.summary.items():
-                if info["forwards"] != expected or info["kv_forwards"] != expected:
-                    raise RuntimeError(f"{name}: expected {expected} forwards and KV snapshots, got {info}")
-                self.summary[name] = {key: info[key] for key in ("forwards", "sequence_lengths")}
             if self.inputs:
                 raise RuntimeError("Some calibration inputs were not written to disk")
             self.inputs = self.disk_cache
@@ -206,16 +219,6 @@ class HunyuanCalibrator(DiffusionCalibrator):
                 "Tuning will read one layer at a time; full model weights still move to CPU.",
                 flush=True,
             )
-            return
-        for name, inputs in self.inputs.items():
-            count = len(inputs["hidden_states"])
-            if count != nsamples * self.calib_num_inference_steps:
-                raise RuntimeError(
-                    f"{name}: expected {nsamples * self.calib_num_inference_steps} forwards, got {count}"
-                )
-            if len(inputs.get("ar_keys", [])) != count:
-                raise RuntimeError(f"{name}: missing per-step KV snapshots")
-            self.summary[name] = {"forwards": count, "sequence_lengths": [x.shape[1] for x in inputs["hidden_states"]]}
 
     def _make_block_forward_func(self, name):
         capture = super()._make_block_forward_func(name)
@@ -248,10 +251,13 @@ class HunyuanCalibrator(DiffusionCalibrator):
                 kwargs.update(ar_kv_positions=torch.empty(1, 0, dtype=torch.long), ar_kv_length=torch.tensor([0]))
             kwargs.update(ar_keys=keys, ar_values=values)
             result = capture(module, hidden_states, *args, **kwargs)
+            info = self.summary.setdefault(name, {"forwards": 0, "sequence_lengths": []})
+            info["forwards"] += 1
+            info["sequence_lengths"].append(hidden_states.shape[1])
             if self.disk_cache is not None:
                 self.disk_cache.append(name, self.inputs.pop(name))
                 if module.layer_idx == len(self.model.model.layers) - 1:
-                    count = self.disk_cache.summary[name]["forwards"]
+                    count = info["forwards"]
                     if count % self.calib_num_inference_steps == 0:
                         self.prompt_count += 1
                         projected = (
@@ -331,7 +337,7 @@ class HunyuanPipeline(DiffusionPipeline):
 
 def build_quantizer(model, args):
     blocks = list(model.model.layers)
-    block_groups = [[f"model.layers.{i}"] for i in range(len(blocks))]
+    block_groups = [[f"model.layers.{i}" for i in range(len(blocks))]]
     originals = [install_replay_forward(block) for block in blocks]
     pipe = HunyuanPipeline(
         model, image_size=args.image_size, seed=args.seed, num_inference_steps=args.num_inference_steps
@@ -371,6 +377,9 @@ def build_quantizer(model, args):
             guidance_scale=args.guidance_scale,
         )
     quantizer.post_init()
+    # Enable AutoRound's existing per-layer auxiliary-input path. Hidden states
+    # flow through the block runner; each layer still receives its own KV state.
+    quantizer.has_variable_block_shape = True
     if args.layer_config:
         expert_schemes = Counter(
             f"W{cfg['bits']}A{cfg['act_bits']}"
