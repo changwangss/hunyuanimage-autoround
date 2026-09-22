@@ -27,6 +27,21 @@ from auto_round.compressors.diffusion_mixin import DiffusionMixin
 from auto_round.utils import parse_layer_config_arg
 
 
+def validate_hunyuan_config(config):
+    """Accept the published model type and the native config's serialized alias."""
+    model_type = config.get("model_type")
+    architectures = config.get("architectures") or []
+    is_hunyuan_image = model_type == "hunyuan_image_3_moe" or (
+        model_type == "Hunyuan" and "HunyuanImage3ForCausalMM" in architectures
+    )
+    if not is_hunyuan_image or config.get("cfg_distilled") is not True:
+        raise ValueError(
+            "Expected a HunyuanImage 3 Instruct Distil checkpoint; "
+            f"got model_type={model_type!r}, architectures={architectures!r}, "
+            f"cfg_distilled={config.get('cfg_distilled')!r}"
+        )
+
+
 @contextmanager
 def compatible_cache_initialization(cache_class):
     """Bridge native Hunyuan's one-argument call to newer Transformers caches."""
@@ -365,8 +380,7 @@ def main():
 
     args = parse_args()
     config = json.loads((args.model / "config.json").read_text())
-    if config.get("model_type") != "hunyuan_image_3_moe" or not config.get("cfg_distilled"):
-        raise ValueError("This script targets Tencent HunyuanImage 3 Instruct Distil only.")
+    validate_hunyuan_config(config)
     if "." in args.model.name:
         raise ValueError("Use a model directory name without dots, as required by Tencent custom code.")
     max_memory = None

@@ -12,7 +12,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoRoundConfig
 
 from auto_round.experimental.qmodules.mx import MXFP4QuantLinear, MXFP8QuantLinear
-from quantize_hunyuan_mxfp8 import compatible_cache_initialization
+from quantize_hunyuan_mxfp8 import compatible_cache_initialization, validate_hunyuan_config
 
 
 def preserve_router_precision(model):
@@ -101,8 +101,10 @@ def main():
     if "." in args.model.name:
         parser.error("Tencent custom code requires a model directory name without dots")
     config = json.loads((args.model / "config.json").read_text())
-    if config.get("model_type") != "hunyuan_image_3_moe" or not config.get("cfg_distilled"):
-        parser.error("Expected a HunyuanImage 3 Instruct Distil checkpoint")
+    try:
+        validate_hunyuan_config(config)
+    except ValueError as error:
+        parser.error(str(error))
     quant_config = config.get("quantization_config", {})
     if quant_config.get("quant_method") != "auto-round" or quant_config.get("data_type") != "mx_fp":
         parser.error("Expected the AutoRound MXFP checkpoint exported by quantize_hunyuan_mxfp8.py")

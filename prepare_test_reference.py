@@ -10,6 +10,7 @@ from urllib.request import urlopen
 
 REVISION = "c8ffd07206f1b843697606968196e8f59f8ff38c"
 SOURCES = {
+    "configuration_hunyuan_image_3.py": "1abbc86ed1bc478b109841869e2af3e8777af771c009ac147d7fb99547ab9c28",
     "modeling_hunyuan_image_3.py": "0dd3ec2592ab7458534a6b22eb0c16864aaee9c1869e4a1422ab5e308e02a71b",
     "hunyuan_image_3_pipeline.py": "c15de3e4bddf1e00b2eb57f75394d1a394bf224dd9bb4d407b1dbb75fc0c3601",
 }

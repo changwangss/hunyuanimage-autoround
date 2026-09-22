@@ -1,6 +1,7 @@
 """Small checks only: no claim of full Hunyuan model validation."""
 
 import ast
+import importlib.util
 import json
 import re
 import sys
@@ -25,6 +26,7 @@ from quantize_hunyuan_mxfp8 import (
     compatible_cache_initialization,
     install_replay_forward,
     parse_args,
+    validate_hunyuan_config,
 )
 from auto_round.utils import parse_layer_config_arg
 from auto_round.data_type.utils import get_quant_func
@@ -54,6 +56,47 @@ def native_cache_class():
 
 
 HunyuanStaticCache = native_cache_class()
+
+
+def test_native_config_roundtrip_is_accepted_by_qdq_cli(monkeypatch, tmp_path):
+    source = Path(__file__).parent / "reference/configuration_hunyuan_image_3.py"
+    spec = importlib.util.spec_from_file_location("native_hunyuan_config_test", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = {
+        "model_type": "hunyuan_image_3_moe",
+        "architectures": ["HunyuanImage3ForCausalMM"],
+        "cfg_distilled": True,
+        "use_meanflow": True,
+        "quantization_config": {"quant_method": "auto-round", "data_type": "mx_fp", "bits": 8},
+    }
+    validate_hunyuan_config(config)
+    directory = tmp_path / "quantized_model"
+    module.HunyuanImage3Config.from_dict(config).save_pretrained(directory)
+    saved = json.loads((directory / "config.json").read_text())
+    assert saved["model_type"] == "Hunyuan"
+    validate_hunyuan_config(saved)
+    loader = Mock(side_effect=RuntimeError("reached checkpoint loader"))
+    monkeypatch.setattr(inference, "load_qdq_model", loader)
+    monkeypatch.setattr(sys, "argv", ["infer_hunyuan_qdq.py", "--model", str(directory), "--prompt", "a dog"])
+    with pytest.raises(RuntimeError, match="reached checkpoint loader"):
+        inference.main()
+    loader.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"cfg_distilled": False},
+        {"cfg_distilled": None},
+        {"architectures": ["OtherHunyuanModel"]},
+    ],
+)
+def test_config_check_still_rejects_wrong_models(change):
+    config = {"model_type": "Hunyuan", "architectures": ["HunyuanImage3ForCausalMM"], "cfg_distilled": True}
+    config.update(change)
+    with pytest.raises(ValueError, match="model_type=.*architectures=.*cfg_distilled="):
+        validate_hunyuan_config(config)
 
 
 def native_scheduler():

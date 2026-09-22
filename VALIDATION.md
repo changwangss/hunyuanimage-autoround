@@ -5,7 +5,11 @@ Validated on 2026-09-22 against AutoRound commit
 
 ## Executed checks
 
-- Sixteen tests passed in `test_adapter.py`:
+- Twenty tests passed in `test_adapter.py`:
+  - Native Tencent config save/reload changes `model_type` from
+    `hunyuan_image_3_moe` to `Hunyuan`; the QDQ CLI accepts the resulting config.
+    Non-distilled, missing-distillation and unrelated Hunyuan architectures are
+    still rejected (three negative cases).
   - Native Hunyuan router retains FP32 routing after weight dequantization,
     with activation QDQ still enabled.
   - QDQ generation forwards inference settings and saves a PIL result. The
