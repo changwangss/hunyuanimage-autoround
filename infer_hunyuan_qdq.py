@@ -8,19 +8,26 @@ from collections import Counter
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 from transformers import AutoModelForCausalLM, AutoRoundConfig
 
 from auto_round.experimental.qmodules.mx import MXFP4QuantLinear, MXFP8QuantLinear
-from quantize_hunyuan_mxfp8 import compatible_cache_initialization, load_hunyuan_tokenizer, validate_hunyuan_config
+from quantize_hunyuan_mxfp8 import (
+    compatible_ar_generation,
+    compatible_cache_initialization,
+    configure_ar_sampling,
+    load_hunyuan_tokenizer,
+    validate_hunyuan_config,
+)
 
 
 def set_activation_qdq(model, enabled):
     for layer in model.modules():
         if isinstance(layer, (MXFP4QuantLinear, MXFP8QuantLinear)):
-            layer.pre_dequantized_input = not enabled
+            layer.pre_dequantized_input = not enabled or (layer.config.act_bits or 16) >= 16
 
 
 def use_rceil_activation_qdq(model):
@@ -116,19 +123,38 @@ def preserve_router_precision(model):
             layer.pre_dequantize()
 
 
+@contextmanager
+def compatible_weight_only_mx_loading():
+    """Admit weight-only MX to the torch loader; callers must bypass input QDQ."""
+    from auto_round.inference import backend
+
+    original = backend.check_compatible
+
+    def check(name, device, config, *args, **kwargs):
+        if name in {"auto_round:torch_mxfp4", "auto_round:torch_mxfp8"} and (config.get("act_bits") or 16) >= 16:
+            # Keep all weight/device/packing checks. Activation fields are not
+            # applicable to weight-only execution and may be absent in exports.
+            config = {key: value for key, value in config.items() if key not in backend.BACKEND_ACT_ATTRS}
+        return original(name, device, config, *args, **kwargs)
+
+    with patch.object(backend, "check_compatible", check):
+        yield
+
+
 def load_qdq_model(model_dir, device_map="auto", max_memory=None, **model_kwargs):
     """Keep saved quantization settings; override only the execution backend."""
-    model, loading_info = AutoModelForCausalLM.from_pretrained(
-        str(model_dir),
-        local_files_only=True,
-        trust_remote_code=True,
-        torch_dtype="auto",
-        device_map=device_map,
-        max_memory=max_memory,
-        quantization_config=AutoRoundConfig(backend="torch"),
-        output_loading_info=True,
-        **model_kwargs,
-    )
+    with compatible_weight_only_mx_loading():
+        model, loading_info = AutoModelForCausalLM.from_pretrained(
+            str(model_dir),
+            local_files_only=True,
+            trust_remote_code=True,
+            torch_dtype="auto",
+            device_map=device_map,
+            max_memory=max_memory,
+            quantization_config=AutoRoundConfig(backend="torch"),
+            output_loading_info=True,
+            **model_kwargs,
+        )
     problems = {key: value for key, value in loading_info.items() if value}
     if problems:
         raise RuntimeError(f"Checkpoint did not load cleanly: {problems}")
@@ -144,6 +170,11 @@ def load_qdq_model(model_dir, device_map="auto", max_memory=None, **model_kwargs
         raise RuntimeError(
             "No MXFP QDQ layers were loaded; check the exported quantization_config and AutoRound version."
         )
+    for layer in layers.values():
+        if layer.config.act_bits is None:
+            layer.config = deepcopy(layer.config)
+            layer.config.act_bits = 16
+    set_activation_qdq(model, enabled=True)
     preserve_router_precision(model)
     schemes = Counter(f"W{layer.config.bits}A{layer.config.act_bits}" for layer in layers.values())
     experts = Counter(
@@ -151,21 +182,6 @@ def load_qdq_model(model_dir, device_map="auto", max_memory=None, **model_kwargs
     )
     print("Loaded QDQ layers:", dict(schemes), "routed experts:", dict(experts))
     return model.eval()
-
-
-@contextmanager
-def compatible_ar_generation(model):
-    """Keep the cache flag required by newer Transformers AR decoding loops."""
-    original = model._update_model_kwargs_for_generation
-
-    def update(outputs, model_kwargs, *args, **kwargs):
-        updated = original(outputs, model_kwargs, *args, **kwargs)
-        if model_kwargs.get("mode") == "gen_text" and "use_cache" in model_kwargs:
-            updated["use_cache"] = model_kwargs["use_cache"]
-        return updated
-
-    with patch.object(model, "_update_model_kwargs_for_generation", update):
-        yield
 
 
 @torch.inference_mode()
@@ -178,6 +194,9 @@ def generate_image(
     seed=42,
     bot_task="image",
     max_new_tokens=2048,
+    ar_temperature=None,
+    ar_top_p=None,
+    ar_top_k=None,
 ):
     config = deepcopy(model.generation_config)
     config.diff_infer_steps = num_inference_steps
@@ -186,6 +205,7 @@ def generate_image(
         # AR sampling uses the global RNG; native seed= controls image noise.
         torch.manual_seed(seed)
         config.max_new_tokens = max_new_tokens
+        configure_ar_sampling(config, ar_temperature, ar_top_p, ar_top_k)
     model_module = sys.modules[type(model).__module__]
     ar_context = compatible_ar_generation(model) if bot_task != "image" else nullcontext()
     with compatible_cache_initialization(model_module.HunyuanStaticCache), ar_context:
@@ -225,6 +245,11 @@ def main():
         help="Direct image generation, or native AR reasoning/recaptioning followed by image generation",
     )
     parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum generated AR text tokens")
+    parser.add_argument(
+        "--ar-temperature", type=float, default=None, help="0 for greedy AR; omitted keeps checkpoint defaults"
+    )
+    parser.add_argument("--ar-top-p", type=float, default=None)
+    parser.add_argument("--ar-top-k", type=int, default=None, help="-1 or 0 disables top-k filtering")
     parser.add_argument("--debug", action="store_true", help="Check block finiteness and save denoising/VAE statistics")
     parser.add_argument(
         "--disable-act-quant", action="store_true", help="Diagnostic: keep saved weights but bypass activation QDQ"
@@ -242,6 +267,10 @@ def main():
     )
     parser.add_argument("--max-memory", type=json.loads, help='GPU memory budgets, e.g. {"0":"70GiB","1":"70GiB"}')
     args = parser.parse_args()
+    try:
+        configure_ar_sampling(SimpleNamespace(), args.ar_temperature, args.ar_top_p, args.ar_top_k)
+    except ValueError as error:
+        parser.error(str(error))
     if args.act_qdq != "checkpoint" and (args.bf16 or args.disable_act_quant):
         parser.error("--act-qdq rceil cannot be combined with --bf16 or --disable-act-quant")
     args.model = args.model.resolve()
@@ -330,6 +359,9 @@ def main():
             args.seed,
             bot_task=args.bot_task,
             max_new_tokens=args.max_new_tokens,
+            ar_temperature=args.ar_temperature,
+            ar_top_p=args.ar_top_p,
+            ar_top_k=args.ar_top_k,
         )
     if args.debug:
         from PIL import ImageStat

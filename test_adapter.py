@@ -21,6 +21,8 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin
 
 from quantize_hunyuan_mxfp8 import (
     HunyuanPipeline,
+    configure_ar_sampling,
+    sample_ar_forwards,
     build_quantizer,
     calibration_schedule,
     compatible_cache_initialization,
@@ -303,8 +305,11 @@ def test_qdq_generation_uses_full_inference_steps(monkeypatch, tmp_path):
     assert HunyuanStaticCache.update is original_update
 
 
-@pytest.mark.parametrize("bot_task", ["recaption", "think_recaption"])
-def test_native_ar_text_is_passed_to_image_generation(monkeypatch, capsys, bot_task):
+@pytest.mark.parametrize(
+    "bot_task,target",
+    [("recaption", "inference"), ("think_recaption", "inference"), ("think_recaption", "calibration")],
+)
+def test_native_ar_text_is_passed_to_image_generation(monkeypatch, capsys, bot_task, target):
     from types import MethodType
 
     source = Path(__file__).parent / "reference/modeling_hunyuan_image_3.py"
@@ -342,6 +347,9 @@ def test_native_ar_text_is_passed_to_image_generation(monkeypatch, capsys, bot_t
         calls.append(kwargs)
         if kwargs["mode"] == "gen_text":
             assert kwargs["generation_config"].max_new_tokens == 64
+            assert kwargs["generation_config"].do_sample is False
+            if target == "calibration":
+                pipe.current_ar_forwards = 5
             return torch.tensor([[10, 11, 20, 22]])
         return [image]
 
@@ -349,17 +357,24 @@ def test_native_ar_text_is_passed_to_image_generation(monkeypatch, capsys, bot_t
     monkeypatch.setattr(model, "generate", generate, raising=False)
     monkeypatch.setattr(model, "_update_model_kwargs_for_generation", Mock(), raising=False)
     monkeypatch.setattr(model, "generate_image", MethodType(env["generate_image"], model))
-    result = inference.generate_image(model, "a cute cat", bot_task=bot_task, max_new_tokens=64)
-    assert result is image
-    assert [call["mode"] for call in calls] == ["gen_text", "gen_image"]
+    if target == "inference":
+        result = inference.generate_image(model, "a cute cat", bot_task=bot_task, max_new_tokens=64, ar_temperature=0)
+        assert result is image
+        assert [call["mode"] for call in calls] == ["gen_text", "gen_image"]
+        assert "[AR]" in capsys.readouterr().out
+    else:
+        pipe = HunyuanPipeline(model, calib_mode="ar-dit", calib_ar_samples=3, ar_max_new_tokens=64, ar_temperature=0)
+        pipe("a cute cat")
+        assert [call["mode"] for call in calls] == ["gen_text", "gen_text", "gen_image"]
+        assert pipe.ar_calibration_records[0]["indices"] == sample_ar_forwards(5, 3, 42)
+        assert len([record for record in prepared if record["mode"] == "gen_image"]) == 1
     assert prepared[0]["max_new_tokens"] == 64
-    assert prepared[1]["prompt"] == "a cute cat"
-    assert "a cat sitting on a windowsill" in prepared[1]["cot_text"][0]
-    assert calls[1]["generation_config"].diff_infer_steps == 8
+    assert prepared[-1]["prompt"] == "a cute cat"
+    assert "a cat sitting on a windowsill" in prepared[-1]["cot_text"][0]
+    assert calls[-1]["generation_config"].diff_infer_steps == 8
     if bot_task == "think_recaption":
         assert calls[0]["stage_transitions"] == [(21, [23])]
         assert calls[0]["final_stop_tokens"] == [22]
-    assert "[AR]" in capsys.readouterr().out
     assert model.generation_config.bot_task == "image"
     assert not hasattr(model.generation_config, "max_new_tokens")
 
@@ -1090,3 +1105,279 @@ def test_chained_blocks_match_independent_blocks(monkeypatch, tmp_path, disk, ca
     torch.testing.assert_close(weights[0], weights[1], rtol=0, atol=0)
     if disk:
         assert sizes[1] < sizes[0]
+
+
+class MixedTinyModel(TinyModel):
+    def prepare_model_inputs(self, **kwargs):
+        return kwargs
+
+    def _update_model_kwargs_for_generation(self, outputs, model_kwargs, *args, **kwargs):
+        return model_kwargs
+
+    def generate_image(self, **kwargs):
+        if kwargs.get("bot_task") != "think_recaption":
+            return super().generate_image(**kwargs)
+        # Exercise native AR prefill/decode with spare cache capacity and an
+        # early EOS equivalent on one prompt. This is not full-model generation.
+        count = 2 if kwargs["prompt"] == "a dog" else kwargs["max_new_tokens"]
+        cache = HunyuanStaticCache(config=self.config, max_cache_len=32, dynamic=True)
+        for step in range(count):
+            positions = (
+                torch.arange(5, device=self.device)[None]
+                if step == 0
+                else torch.tensor([[4 + step]], device=self.device)
+            )
+            h = torch.randn(1, positions.shape[1], 64, device=self.device, dtype=self.dtype)
+            mask = torch.ones(5, 5, device=self.device, dtype=torch.bool).tril()[None, None] if step == 0 else None
+            for block in self.model.layers:
+                h = block(
+                    h,
+                    position_ids=positions,
+                    attention_mask=mask,
+                    past_key_value=cache,
+                    use_cache=True,
+                    custom_pos_emb=rotary(positions, h.dtype),
+                )[0]
+        cot_text = getattr(self, "cot_text", ["<think>synthetic reasoning</think><recaption>a cat</recaption>"])
+        self.prepare_model_inputs(mode="gen_image", cot_text=cot_text)
+        image = super().generate_image(**kwargs)
+        return cot_text, [image]
+
+
+@pytest.mark.parametrize("disk,activation_mode", [(False, "quantized"), (True, "quantized"), (True, "weight-only")])
+def test_mixed_ar_dit_native_replay_and_real_tuning(monkeypatch, tmp_path, disk, activation_mode):
+    from copy import deepcopy
+
+    monkeypatch.setattr(
+        "auto_round.compressors.diffusion.dataset._load_coco_dataframe",
+        lambda *args: pd.DataFrame({"id": [1, 2], "caption": ["a cat", "a dog"]}),
+    )
+    torch.manual_seed(17)
+    model = MixedTinyModel(make_config()).to("cuda:0", dtype=torch.bfloat16).eval()
+    args = SimpleNamespace(
+        image_size="1024x1024",
+        seed=42,
+        iters=2,
+        nsamples=2,
+        device="0",
+        num_inference_steps=2,
+        calib_num_inference_steps=2,
+        guidance_scale=5.0,
+        layer_config=parse_layer_config_arg("{mlp.experts:{scheme:MXFP4}}"),
+        calib_cache_dir=tmp_path / "cache" if disk else None,
+        calib_mode="ar-dit",
+        calib_ar_samples=3,
+        ar_max_new_tokens=6,
+        ar_temperature=0.0,
+        activation_mode=activation_mode,
+    )
+    quantizer, originals = build_quantizer(model, args)
+    live = {i: [] for i in range(2)}
+    preview_count = []
+    native_generate = model.generate_image
+
+    def checked_generate(**kwargs):
+        preview = not quantizer.pipe.capture_enabled
+        cache = quantizer.calibration.disk_cache
+        before = (
+            cache.bytes_written
+            if disk
+            else {name: len(inputs.get("ar_keys", [])) for name, inputs in quantizer.calibration.inputs.items()}
+        )
+        try:
+            return native_generate(**kwargs)
+        finally:
+            if preview:
+                after = (
+                    cache.bytes_written
+                    if disk
+                    else {name: len(inputs.get("ar_keys", [])) for name, inputs in quantizer.calibration.inputs.items()}
+                )
+                assert before == after  # preview must not accumulate discarded snapshots
+                preview_count.append(1)
+
+    monkeypatch.setattr(model, "generate_image", checked_generate)
+
+    def observe(module, positional, kwargs, output):
+        cache = kwargs.get("past_key_value")
+        if (
+            cache is not None
+            and quantizer.pipe.capture_enabled
+            and (not cache.dynamic or quantizer.pipe.current_ar_forwards - 1 in quantizer.pipe.ar_capture_indices)
+        ):
+            live[module.layer_idx].append(output[0].detach().cpu())
+
+    handles = [block.register_forward_hook(observe, with_kwargs=True) for block in model.model.layers]
+    original_calib = quantizer.calibration.calib
+    captured = []
+
+    def calib(nsamples, bs):
+        original_calib(nsamples, bs)
+        snapshots = deepcopy(dict(quantizer.calibration.inputs))
+        captured.append(snapshots)
+        for handle in handles:
+            handle.remove()
+        # Check every selected AR and DiT forward against the original native
+        # attention trajectory, through both blocks and their distinct KV state.
+        first = snapshots["model.layers.0"]
+        assert len(first["hidden_states"]) == 9  # (3 AR + 2 DiT) + (2 AR + 2 DiT)
+        for i, hidden in enumerate(first["hidden_states"]):
+            hidden = hidden.to("cuda:0")
+            for layer_idx, block in enumerate(model.model.layers):
+                inputs = snapshots[f"model.layers.{layer_idx}"]
+
+                def to_gpu(value):
+                    if isinstance(value, torch.Tensor):
+                        return value.to("cuda:0")
+                    if isinstance(value, tuple):
+                        return tuple(to_gpu(v) for v in value)
+                    return value
+
+                kwargs = {
+                    key: to_gpu(value[i] if isinstance(value, list) else value)
+                    for key, value in inputs.items()
+                    if key not in {"hidden_states", "positional_inputs"}
+                }
+                with torch.no_grad():
+                    hidden = block.orig_forward(hidden, **kwargs)[0]
+                torch.testing.assert_close(hidden.cpu(), live[layer_idx][i], rtol=0, atol=0)
+        # AR snapshots must exclude the unused 32-token cache capacity.
+        assert max(value.shape[2] for value in first["ar_keys"]) < 32
+        assert len(first["attention_mask"]) == 9
+        assert sum(mask.numel() == 0 for mask in first["attention_mask"]) == 7
+
+    monkeypatch.setattr(quantizer.calibration, "calib", calib)
+    try:
+        quantizer.quantize()
+        assert quantizer.model_context.quantized
+        assert len(captured) == 1
+        assert len(preview_count) == 2
+        assert all(
+            info["ar_forwards"] == 5 and info["dit_forwards"] == 4 for info in quantizer.calibration.summary.values()
+        )
+        records = quantizer.pipe.ar_calibration_records
+        assert sorted(record["forwards"] for record in records) == [2, 6]
+        for record in records:
+            assert record["indices"] == sample_ar_forwards(record["forwards"], 3, record["seed"])
+            assert record["indices"][-1] == record["forwards"] - 1
+            assert record["sampling"]["do_sample"] is False
+        assert model.generation_config.__dict__ == {"diff_infer_steps": 8, "diff_guidance_scale": 2.5}
+        if activation_mode == "weight-only":
+            for name, config in quantizer.layer_config.items():
+                if config["bits"] < 16:
+                    assert config["act_bits"] == 16
+        else:
+            assert all(
+                config["act_bits"] == 4 for name, config in quantizer.layer_config.items() if ".mlp.experts." in name
+            )
+        assert all(call["bot_task"] == "think_recaption" for call in model.calls)
+        assert all(call["generation_config"].max_new_tokens == 6 for call in model.calls)
+        if activation_mode == "weight-only":
+            for block, original in zip(model.model.layers, originals):
+                block.forward = original
+            destination = tmp_path / "weight-only"
+            quantizer.save_quantized(str(destination), format="auto_round", inplace=True)
+            exported = json.loads((destination / "config.json").read_text())["quantization_config"]
+            assert exported.get("act_bits", 16) == 16
+            config = make_config()
+            config.quantization_config = exported
+            monkeypatch.setattr(inference, "AutoModelForCausalLM", TinyModel)
+            loaded = inference.load_qdq_model(destination, device_map="cuda:0", config=config)
+            probe = torch.randn(1, 3, 64, device="cuda:0", dtype=torch.bfloat16)
+            checked = 0
+            for layer in loaded.modules():
+                if isinstance(layer, (MXFP4QuantLinear, MXFP8QuantLinear)):
+                    assert layer.config.act_bits == 16
+                    expected = torch.nn.functional.linear(probe, layer.dequant_weight_online().to(probe), layer.bias)
+                    torch.testing.assert_close(layer(probe), expected, rtol=0, atol=0)
+                    checked += 1
+            assert checked == 10
+        if disk:
+            assert len(quantizer.calibration.disk_cache) == 0
+    finally:
+        for handle in handles:
+            handle.remove()
+        for block, original in zip(model.model.layers, originals):
+            block.forward = original
+        quantizer.calibration.close()
+
+
+@pytest.mark.parametrize("total,budget", [(1, 8), (2, 2), (8, 8), (100, 8), (2048, 8)])
+def test_ar_sampling_covers_trajectory_without_changing_generation_rng(total, budget):
+    torch.manual_seed(123)
+    before = torch.random.get_rng_state().clone()
+    selected = sample_ar_forwards(total, budget, 42)
+    assert len(selected) == min(total, budget)
+    assert selected == sorted(set(selected))
+    assert selected[0] == 0 and selected[-1] == total - 1
+    if total > budget:
+        for i, index in enumerate(selected[1:-1]):
+            assert 1 + i * (total - 2) // (budget - 2) <= index < 1 + (i + 1) * (total - 2) // (budget - 2)
+    assert torch.equal(torch.random.get_rng_state(), before)
+    assert selected == sample_ar_forwards(total, budget, 42)
+
+
+def test_ar_sampling_options_preserve_defaults_and_normalize_greedy():
+    config = SimpleNamespace(do_sample=True, temperature=0.6, top_p=0.95, top_k=1024, max_new_tokens=2048)
+    assert configure_ar_sampling(config)["temperature"] == 0.6
+    actual = configure_ar_sampling(config, temperature=0, top_k=-1)
+    assert actual == dict(do_sample=False, temperature=1.0, top_p=1.0, top_k=0, max_new_tokens=2048)
+    assert configure_ar_sampling(config, temperature=0.8, top_p=0.9, top_k=20)["do_sample"] is True
+    for args in ({"temperature": -1}, {"temperature": float("nan")}, {"top_p": 0}, {"top_k": -2}):
+        with pytest.raises(ValueError):
+            configure_ar_sampling(config, **args)
+
+
+@pytest.mark.parametrize("failure", ["different_text", "different_count", "truncated_text"])
+def test_ar_preview_failure_restores_methods_and_does_not_run_dit(monkeypatch, tmp_path, failure):
+    monkeypatch.setattr(
+        "auto_round.compressors.diffusion.dataset._load_coco_dataframe",
+        lambda *args: pd.DataFrame({"id": [1], "caption": ["a cat"]}),
+    )
+    model = MixedTinyModel(make_config()).to("cuda:0", dtype=torch.bfloat16).eval()
+    args = SimpleNamespace(
+        image_size="1024x1024",
+        seed=42,
+        iters=1,
+        nsamples=1,
+        device="0",
+        num_inference_steps=2,
+        calib_num_inference_steps=2,
+        guidance_scale=5.0,
+        layer_config=None,
+        calib_cache_dir=tmp_path / "cache",
+        calib_mode="ar-dit",
+        calib_ar_samples=3,
+        ar_max_new_tokens=6,
+    )
+    original_generate = model.generate_image
+    original_prepare = model.prepare_model_inputs
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(1)
+        model.cot_text = [
+            "<think>unfinished"
+            if failure == "truncated_text"
+            else f"<think>reasoning</think><recaption>cat {len(calls) if failure == 'different_text' else 0}</recaption>"
+        ]
+        if failure == "different_count" and len(calls) == 2:
+            kwargs["max_new_tokens"] -= 1
+        return original_generate(**kwargs)
+
+    monkeypatch.setattr(model, "generate_image", generate)
+    quantizer, originals = build_quantizer(model, args)
+    directory = quantizer.calibration.disk_cache.directory
+    try:
+        expected = "AR recaption is incomplete" if failure == "truncated_text" else "AR replay differs"
+        with pytest.raises(RuntimeError, match=expected):
+            quantizer.quantize()
+        assert model.prepare_model_inputs == original_prepare
+        assert quantizer.pipe.capture_enabled
+        assert model.calls == []  # no DiT or image decoding, including preview
+        assert all(info["dit_forwards"] == 0 for info in quantizer.calibration.summary.values())
+    finally:
+        for block, original in zip(model.model.layers, originals):
+            block.forward = original
+        quantizer.calibration.close()
+    assert not directory.exists()

@@ -1,7 +1,39 @@
 # Validation
 
-Validated on 2026-09-22 against AutoRound commit
+Validated on 2026-09-23 against AutoRound commit
 `6db9435fbff63cf17e2df2c5a8ca858392df5eab`.
+
+## Mixed AR + DiT calibration (2026-09-23)
+
+The final complete suite passed **61 tests in 145.38 seconds** (5 warnings).
+Ruff checks, formatting checks, `git diff --check`, and parsing the documented
+mixed-calibration CLI options also passed. The targeted subset passed 15 tests
+in 30.81 seconds. New coverage includes:
+
+- Two-pass AR sampling with deterministic disjoint interior strata, prefill and
+  final decode, short AR sequences, and no change to the generation RNG from
+  selecting sample indices.
+- No calibration-cache growth during the counting pass. Native input preparation
+  is intercepted before DiT, so only the replay performs image generation.
+- Exact selected-input replay across two blocks using Tencent's pinned native
+  SDPA attention and HunyuanStaticCache, through memory and disk caches.
+- Actual mixed MXFP8/MXFP4 AutoRound tuning with W8A8/W4A4 and W8A16/W4A16.
+  Every selected AR/DiT replay output equals its native reference with
+  `rtol=0, atol=0`; unused AR cache capacity is excluded.
+- Export and QDQ reload of the tuned weight-only checkpoint. All ten quantized
+  linear layers use A16 and match a dequantized-weight Linear exactly. AutoRound
+  omits activation fields from weight-only metadata; the standalone loader's
+  scoped compatibility adapter admits these schemes and bypasses input QDQ.
+- Tencent's actual `generate_image` dispatch receives the same greedy settings
+  on both AR passes and hands the generated recaption to DiT exactly once.
+  Token generation and the image pipeline are stubbed in this dispatch test.
+- Truncated recaptions, changed replay text, and changed AR forward counts stop
+  calibration before DiT. Patched methods and capture state are restored, and
+  temporary cache files are cleaned up.
+
+The integration tests use synthetic hidden states and mocked COCO captions.
+They do not establish full 80B AR/DiT image quality, target-device memory usage,
+vLLM-Omni checkpoint compatibility, or equivalence to Omni's AR-to-DiT KV reuse.
 
 ## Executed checks
 

@@ -11,10 +11,10 @@ import json
 import shutil
 import sys
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from pathlib import Path
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -85,6 +85,21 @@ def compatible_cache_initialization(cache_class):
 
 
 @contextmanager
+def compatible_ar_generation(model):
+    """Keep the cache flag required by newer Transformers AR decoding loops."""
+    original = model._update_model_kwargs_for_generation
+
+    def update(outputs, model_kwargs, *args, **kwargs):
+        updated = original(outputs, model_kwargs, *args, **kwargs)
+        if model_kwargs.get("mode") == "gen_text" and "use_cache" in model_kwargs:
+            updated["use_cache"] = model_kwargs["use_cache"]
+        return updated
+
+    with patch.object(model, "_update_model_kwargs_for_generation", update):
+        yield
+
+
+@contextmanager
 def calibration_schedule(pipe, calib_steps, seed):
     """Run a seeded subset of the native schedule on an isolated scheduler."""
     scheduler = deepcopy(pipe.scheduler)
@@ -120,6 +135,47 @@ def calibration_schedule(pipe, calib_steps, seed):
 
     with patch.object(scheduler, "set_timesteps", set_timesteps), patch.object(pipe, "scheduler", scheduler):
         yield schedule
+
+
+def sample_ar_forwards(total, budget, seed):
+    """Keep prefill and final decode, sampling disjoint interior strata."""
+    if total < 1 or budget < 1:
+        raise ValueError("AR forward count and sample budget must be positive")
+    if budget >= total:
+        return list(range(total))
+    if budget == 1:
+        return [0]
+    rng = torch.Generator().manual_seed(seed)
+    indices = [0]
+    for i in range(budget - 2):
+        start = 1 + i * (total - 2) // (budget - 2)
+        stop = 1 + (i + 1) * (total - 2) // (budget - 2)
+        indices.append(torch.randint(start, stop, (), generator=rng).item())
+    return indices + [total - 1]
+
+
+def configure_ar_sampling(config, temperature=None, top_p=None, top_k=None):
+    """Use explicit settings when supplied; otherwise keep checkpoint sampling."""
+    if temperature is not None:
+        if not 0 <= temperature < float("inf"):
+            raise ValueError("AR temperature must be finite and nonnegative")
+        config.do_sample = temperature > 0
+        config.temperature = temperature if temperature > 0 else 1.0
+    if top_p is not None:
+        if not 0 < top_p <= 1:
+            raise ValueError("AR top-p must be in (0, 1]")
+        config.top_p = top_p
+    if top_k is not None:
+        if top_k < -1:
+            raise ValueError("AR top-k must be -1 or nonnegative")
+        config.top_k = max(top_k, 0)  # vLLM -1 and Transformers 0 both disable top-k.
+    if not getattr(config, "do_sample", True):
+        config.temperature, config.top_p, config.top_k = 1.0, 1.0, 0
+    return {key: getattr(config, key, None) for key in ("do_sample", "temperature", "top_p", "top_k", "max_new_tokens")}
+
+
+class ARPreviewComplete(Exception):
+    """Stop the counting pass before DiT input preparation or image decoding."""
 
 
 class ReplayCache:
@@ -178,6 +234,10 @@ def install_replay_forward(block):
     ):
         if past_key_value is None and ar_keys is not None:
             past_key_value = ReplayCache(ar_keys, ar_values, ar_kv_positions, ar_kv_length)
+        # Empty tensors preserve a per-sample None mask through AutoRound's
+        # collector, without changing the native SDPA execution path.
+        if attention_mask is not None and attention_mask.numel() == 0:
+            attention_mask = None
         return original(
             hidden_states,
             attention_mask=attention_mask,
@@ -221,12 +281,18 @@ class HunyuanCalibrator(DiffusionCalibrator):
             # outputs between layers. Only the group entry needs hidden states.
             self.blocks_requiring_input_ids = ["model.layers.0"]
         super().calib(nsamples, bs)
-        expected = nsamples * self.calib_num_inference_steps
+        expected_dit = nsamples * self.calib_num_inference_steps
+        expected_ar = sum(record["captured_forwards"] for record in self.pipe.ar_calibration_records)
+        expected = expected_dit + expected_ar
         for name in self.to_cached_layers:
             if not name.startswith("model.layers."):
                 continue
             info = self.summary.get(name, {})
-            if info.get("forwards") != expected:
+            if (
+                info.get("forwards") != expected
+                or info.get("ar_forwards") != expected_ar
+                or info.get("dit_forwards") != expected_dit
+            ):
                 raise RuntimeError(f"{name}: expected {expected} forwards, got {info}")
             saved = (
                 len(self.disk_cache.files.get(name, []))
@@ -250,9 +316,32 @@ class HunyuanCalibrator(DiffusionCalibrator):
 
         def forward(module, hidden_states=None, *args, **kwargs):
             cache = kwargs.get("past_key_value")
-            if cache is None or getattr(cache, "dynamic", False):
-                raise RuntimeError("Expected the static KV cache from direct image generation.")
+            if cache is None:
+                raise RuntimeError("Expected Hunyuan's native KV cache.")
+            is_ar = getattr(cache, "dynamic", False)
+            if is_ar:
+                if self.pipe.calib_mode != "ar-dit":
+                    raise RuntimeError("AR forward encountered in DiT-only calibration")
+                if module.layer_idx == 0:
+                    self.pipe.current_ar_forwards += 1
+                index = self.pipe.current_ar_forwards - 1
+                if not self.pipe.capture_enabled or index not in self.pipe.ar_capture_indices:
+                    # Counting pass and unselected tokens only run native AR.
+                    return module.orig_forward(hidden_states, *args, **kwargs)
             state = cache.layers[module.layer_idx]
+            positions = kwargs["position_ids"]
+            # Native AR caches allocate max_new_tokens capacity, but attention
+            # must only see the prefix ending at this forward's current token.
+            length = (
+                int(positions.max().item()) + 1
+                if is_ar
+                else (state.keys.shape[2] if state.keys is not None else hidden_states.shape[1])
+            )
+            if self.pipe.calib_mode == "ar-dit" and kwargs.get("attention_mask") is None:
+                # A None mask after a tensor mask is not appended by AutoRound.
+                # Store an empty marker; install_replay_forward restores None
+                # for both live generation and tuning.
+                kwargs["attention_mask"] = torch.empty(1, 0, dtype=torch.bool, device=hidden_states.device)
             if state.keys is None:
                 attn = module.self_attn
                 shape = (hidden_states.shape[0], attn.num_key_value_heads, 0, attn.head_dim)
@@ -261,7 +350,6 @@ class HunyuanCalibrator(DiffusionCalibrator):
             elif self.disk_cache is not None:
                 if hidden_states.shape[0] != 1:
                     raise ValueError("Compact Hunyuan calibration requires batch_size=1")
-                length = state.keys.shape[2]
                 keep = torch.ones(length, dtype=torch.bool, device=state.keys.device)
                 keep[kwargs["position_ids"].reshape(-1).to(keep.device)] = False
                 indices = keep.nonzero().flatten()
@@ -270,19 +358,22 @@ class HunyuanCalibrator(DiffusionCalibrator):
                 kwargs.update(ar_kv_positions=indices.cpu()[None], ar_kv_length=torch.tensor([length]))
             else:
                 # Copy before forward: Hunyuan updates its cache in place.
-                keys = state.keys.detach().to(device="cpu", copy=True)
-                values = state.values.detach().to(device="cpu", copy=True)
+                keys = state.keys[:, :, :length].detach().to(device="cpu", copy=True)
+                values = state.values[:, :, :length].detach().to(device="cpu", copy=True)
             if self.disk_cache is not None and state.keys is None:
                 kwargs.update(ar_kv_positions=torch.empty(1, 0, dtype=torch.long), ar_kv_length=torch.tensor([0]))
             kwargs.update(ar_keys=keys, ar_values=values)
             result = capture(module, hidden_states, *args, **kwargs)
-            info = self.summary.setdefault(name, {"forwards": 0, "sequence_lengths": []})
+            info = self.summary.setdefault(
+                name, {"forwards": 0, "ar_forwards": 0, "dit_forwards": 0, "sequence_lengths": []}
+            )
             info["forwards"] += 1
+            info["ar_forwards" if is_ar else "dit_forwards"] += 1
             info["sequence_lengths"].append(hidden_states.shape[1])
             if self.disk_cache is not None:
                 self.disk_cache.append(name, self.inputs.pop(name))
-                if module.layer_idx == len(self.model.model.layers) - 1:
-                    count = info["forwards"]
+                if not is_ar and module.layer_idx == len(self.model.model.layers) - 1:
+                    count = info["dit_forwards"]
                     if count % self.calib_num_inference_steps == 0:
                         self.prompt_count += 1
                         projected = (
@@ -312,7 +403,19 @@ class HunyuanCalibrator(DiffusionCalibrator):
 class HunyuanPipeline(DiffusionPipeline):
     """Route AutoRound to diffusion calibration using the native generation API."""
 
-    def __init__(self, transformer, image_size="1024x1024", seed=42, num_inference_steps=8):
+    def __init__(
+        self,
+        transformer,
+        image_size="1024x1024",
+        seed=42,
+        num_inference_steps=8,
+        calib_mode="dit",
+        calib_ar_samples=8,
+        ar_max_new_tokens=2048,
+        ar_temperature=None,
+        ar_top_p=None,
+        ar_top_k=None,
+    ):
         super().__init__()
         self.register_modules(transformer=transformer)
         self.image_size = image_size
@@ -320,6 +423,70 @@ class HunyuanPipeline(DiffusionPipeline):
         self.prompt_count = 0
         self.num_inference_steps = num_inference_steps
         self.calibration_schedules = []
+        self.calib_mode = calib_mode
+        self.calib_ar_samples = calib_ar_samples
+        self.ar_max_new_tokens = ar_max_new_tokens
+        self.current_ar_forwards = 0
+        self.ar_calibration_records = []
+        self.capture_enabled = True
+        self.ar_capture_indices = set()
+        self.ar_sampling = dict(temperature=ar_temperature, top_p=ar_top_p, top_k=ar_top_k)
+
+    def _generate_mixed(self, call_kwargs, seed):
+        """Count native AR, then repeat it with bounded trajectory-wide capture."""
+        original_prepare = self.transformer.prepare_model_inputs
+        preview = {}
+
+        def stop_before_dit(*args, **kwargs):
+            if kwargs.get("mode") == "gen_image":
+                preview["cot_text"] = deepcopy(kwargs.get("cot_text"))
+                raise ARPreviewComplete
+            return original_prepare(*args, **kwargs)
+
+        self.capture_enabled = False
+        try:
+            torch.manual_seed(seed)
+            with patch.object(self.transformer, "prepare_model_inputs", stop_before_dit):
+                try:
+                    self.transformer.generate_image(**deepcopy(call_kwargs))
+                except ARPreviewComplete:
+                    pass
+        finally:
+            self.capture_enabled = True
+        if "cot_text" not in preview or not self.current_ar_forwards:
+            raise RuntimeError("AR counting pass did not reach native DiT input preparation")
+        cot_text = preview["cot_text"]
+        if not cot_text or any("</recaption>" not in text for text in cot_text):
+            raise RuntimeError("AR recaption is incomplete; increase --ar-max-new-tokens before calibration")
+        total = self.current_ar_forwards
+        indices = sample_ar_forwards(total, self.calib_ar_samples, seed)
+        self.ar_capture_indices = set(indices)
+        self.current_ar_forwards = 0
+
+        def check_before_dit(*args, **kwargs):
+            if kwargs.get("mode") == "gen_image":
+                if kwargs.get("cot_text") != cot_text or self.current_ar_forwards != total:
+                    raise RuntimeError("AR replay differs from the counting pass; refusing mismatched calibration")
+            return original_prepare(*args, **kwargs)
+
+        print(f"AR counting pass: {total} forwards; capturing indices {indices} on replay.", flush=True)
+        torch.manual_seed(seed)
+        with patch.object(self.transformer, "prepare_model_inputs", check_before_dit):
+            result = self.transformer.generate_image(**deepcopy(call_kwargs))
+        if self.current_ar_forwards != total or result[0] != cot_text:
+            raise RuntimeError("AR replay changed its text or forward count")
+        self.ar_calibration_records.append(
+            {
+                "seed": seed,
+                "sampling_method": "two-pass-stratified",
+                "forwards": total,
+                "captured_forwards": len(indices),
+                "indices": indices,
+                "cot_text": cot_text,
+                "sampling": configure_ar_sampling(deepcopy(call_kwargs["generation_config"])),
+            }
+        )
+        return result
 
     @property
     def device(self):
@@ -342,19 +509,37 @@ class HunyuanPipeline(DiffusionPipeline):
         generation_config.diff_infer_steps = self.num_inference_steps
         generation_config.diff_guidance_scale = guidance_scale
         model_module = sys.modules[type(self.transformer).__module__]
-        with compatible_cache_initialization(model_module.HunyuanStaticCache):
+        mixed = self.calib_mode == "ar-dit"
+        ar_context = compatible_ar_generation(self.transformer) if mixed else nullcontext()
+        with compatible_cache_initialization(model_module.HunyuanStaticCache), ar_context:
             for text in prompts:
                 seed = self.seed + self.prompt_count
+                self.current_ar_forwards = 0
+                call_kwargs = dict(
+                    prompt=text,
+                    seed=seed,
+                    image_size=self.image_size,
+                    bot_task="think_recaption" if mixed else "image",
+                    use_system_prompt="en_unified",
+                    generation_config=generation_config,
+                    use_taylor_cache=False,
+                    verbose=0,
+                )
+                if mixed:
+                    generation_config.max_new_tokens = self.ar_max_new_tokens
+                    configure_ar_sampling(generation_config, **self.ar_sampling)
+                    call_kwargs["max_new_tokens"] = self.ar_max_new_tokens
+                    print(f"Calibration prompt {self.prompt_count + 1}: counting AR forwards...", flush=True)
                 with calibration_schedule(self.transformer.pipeline, calib_steps, seed) as schedule:
-                    self.transformer.generate_image(
-                        prompt=text,
-                        seed=seed,
-                        image_size=self.image_size,
-                        bot_task="image",
-                        use_system_prompt="en_unified",
-                        generation_config=generation_config,
-                        use_taylor_cache=False,
-                        verbose=0,
+                    if mixed:
+                        self._generate_mixed(call_kwargs, seed)
+                    else:
+                        self.transformer.generate_image(**call_kwargs)
+                if mixed:
+                    print(
+                        f"Calibration prompt {self.prompt_count + 1}: saved {len(self.ar_capture_indices)}/"
+                        f"{self.current_ar_forwards} AR forwards and {calib_steps} DiT forwards per block.",
+                        flush=True,
                     )
                 self.calibration_schedules.append(schedule)
                 self.prompt_count += 1
@@ -365,13 +550,29 @@ def build_quantizer(model, args):
     block_groups = [[f"model.layers.{i}" for i in range(len(blocks))]]
     originals = [install_replay_forward(block) for block in blocks]
     pipe = HunyuanPipeline(
-        model, image_size=args.image_size, seed=args.seed, num_inference_steps=args.num_inference_steps
+        model,
+        image_size=args.image_size,
+        seed=args.seed,
+        num_inference_steps=args.num_inference_steps,
+        calib_mode=getattr(args, "calib_mode", "dit"),
+        calib_ar_samples=getattr(args, "calib_ar_samples", 8),
+        ar_max_new_tokens=getattr(args, "ar_max_new_tokens", 2048),
+        ar_temperature=getattr(args, "ar_temperature", None),
+        ar_top_p=getattr(args, "ar_top_p", None),
+        ar_top_k=getattr(args, "ar_top_k", None),
     )
 
     def load_adapter(candidate, **kwargs):
         if candidate is not pipe:
             raise TypeError("This temporary loader accepts only this Hunyuan adapter.")
         return pipe, model
+
+    layer_config = deepcopy(args.layer_config) or {}
+    activation_args = {}
+    if getattr(args, "activation_mode", "quantized") == "weight-only":
+        activation_args["act_bits"] = 16
+        for config in layer_config.values():
+            config["act_bits"] = 16
 
     # These patches exist only during construction and are always restored.
     # Preserve Tencent's mixed module dtypes and Transformers save_pretrained.
@@ -383,7 +584,8 @@ def build_quantizer(model, args):
             model=pipe,
             tokenizer=None,
             scheme="MXFP8",
-            layer_config=args.layer_config,
+            layer_config=layer_config,
+            **activation_args,
             dataset="coco2014",
             alg_configs=SignRoundConfig(
                 iters=args.iters, gradient_accumulate_steps=1, nblocks=1, enable_quanted_input=False
@@ -456,6 +658,38 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=None, help="Legacy shorthand setting both step counts")
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument(
+        "--calib-mode",
+        choices=("dit", "ar-dit"),
+        default="dit",
+        help="DiT-only or native think_recaption AR + DiT calibration",
+    )
+    parser.add_argument(
+        "--calib-ar-samples",
+        type=int,
+        default=8,
+        help="AR forwards saved per prompt across the full trajectory, including prefill and final decode (default: 8)",
+    )
+    parser.add_argument(
+        "--ar-max-new-tokens",
+        type=int,
+        default=2048,
+        help="Native AR generation limit, independent of the saved AR sample budget",
+    )
+    parser.add_argument(
+        "--ar-temperature",
+        type=float,
+        default=None,
+        help="AR temperature; 0 uses greedy decoding (Omni base YAML); omitted keeps checkpoint defaults",
+    )
+    parser.add_argument("--ar-top-p", type=float, default=None)
+    parser.add_argument("--ar-top-k", type=int, default=None, help="AR top-k; -1 or 0 disables filtering")
+    parser.add_argument(
+        "--activation-mode",
+        choices=("quantized", "weight-only"),
+        default="quantized",
+        help="quantized: W8A8/W4A4; weight-only: W8A16/W4A16 for a matching runtime kernel",
+    )
+    parser.add_argument(
         "--image-size", default="1024x1024", help="Fixed size avoids autoregressive aspect-ratio generation"
     )
     parser.add_argument("--guidance-scale", type=float, default=5.0)
@@ -486,6 +720,14 @@ def parse_args():
     del args.steps
     if min(args.nsamples, args.num_inference_steps, args.calib_num_inference_steps, args.iters) < 1:
         parser.error("nsamples, steps and iters must be positive; this script performs calibrated tuning")
+    if min(args.calib_ar_samples, args.ar_max_new_tokens) < 1:
+        parser.error("calib-ar-samples and ar-max-new-tokens must be positive")
+    if args.calib_mode == "ar-dit" and args.calib_ar_samples < 2:
+        parser.error("Mixed calibration needs at least 2 AR samples to cover prefill and final decode")
+    try:
+        configure_ar_sampling(SimpleNamespace(), args.ar_temperature, args.ar_top_p, args.ar_top_k)
+    except ValueError as error:
+        parser.error(str(error))
     if args.calib_num_inference_steps > args.num_inference_steps:
         parser.error("calib_num_inference_steps must not exceed num_inference_steps")
     if args.image_size == "auto":
@@ -528,7 +770,8 @@ def main():
     quantizer, original_forwards = build_quantizer(model, args)
     print(
         f"Quantizing {len(original_forwards)} decoder blocks using {args.nsamples} COCO prompts x "
-        f"{args.calib_num_inference_steps} calibration steps sampled from {args.num_inference_steps} steps"
+        f"{args.calib_num_inference_steps} DiT steps sampled from {args.num_inference_steps} steps; "
+        f"mode={args.calib_mode}, AR snapshot limit={args.calib_ar_samples} per prompt"
     )
     try:
         quantizer.quantize()
@@ -545,9 +788,10 @@ def main():
                 "scheme": "MXFP8",
                 "format": "auto_round",
                 "dataset": "coco2014",
-                "bot_task": "image",
+                "bot_task": "think_recaption" if args.calib_mode == "ar-dit" else "image",
                 "calibration": quantizer.calibration.summary,
                 "calibration_schedules": quantizer.pipe.calibration_schedules,
+                "ar_calibration": quantizer.pipe.ar_calibration_records,
             },
             default=str,
             indent=2,

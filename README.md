@@ -68,8 +68,8 @@ be positive and no greater than the full schedule length.
 
 `--nsamples` counts COCO captions, not denoising steps. Four captions with four
 selected steps yield 16 calibration forwards per decoder block. This is a starting recipe,
-not a measured quality recommendation. The script uses direct text-to-image
-generation (`bot_task="image"`), not CoT, prompt rewriting, or image editing.
+not a measured quality recommendation. By default the script uses direct text-to-image
+generation (`bot_task="image"`). Mixed AR + DiT calibration is opt-in below.
 
 Weights load with Accelerate `device_map="auto"` across visible GPUs; `--device`
 selects the tuning GPU. All model weights must fit on the visible GPUs during
@@ -79,6 +79,82 @@ headroom (extend this example to include all GPUs available for this model).
 After calibration, AutoRound moves weights to CPU and tunes blocks individually;
 allow host RAM for the full model plus calibration snapshots. This script is not
 an optimized low-memory loader for an 80B model.
+
+## Mixed AR + DiT calibration
+
+Use `--calib-mode ar-dit` to run native `think_recaption` on each COCO caption
+with the original model, then denoise conditioned on its generated text. Both
+stages contribute inputs to the same AutoRound block reconstruction tuning.
+This does not introduce a separate AR model or a language-model cross-entropy loss.
+
+```bash
+python quantize_hunyuan_mxfp8.py \
+  --model /path/to/HunyuanImage-3-Instruct-Distil \
+  --output /path/to/HunyuanImage-Mixed-AutoRound-AR-DiT \
+  --calib-mode ar-dit --calib-ar-samples 8 --ar-max-new-tokens 2048 \
+  --ar-temperature 0 --activation-mode quantized \
+  --nsamples 16 --num_inference_steps 8 --calib_num_inference_steps 8 \
+  --iters 200 --layer_config '{mlp.experts:{scheme:MXFP4}}' \
+  --image-size 1024x1024 --guidance-scale 5.0 --seed 42 --device 0 \
+  --calib-cache-dir /path/to/hunyuan-calib-cache
+```
+
+`--calib-ar-samples 8` now samples the **complete AR trajectory**. A counting pass
+runs native AR without saving snapshots and stops before preparing DiT inputs or
+decoding an image. A second pass repeats AR with the same seed and generation
+settings. It saves prefill, the final decode, and one seeded random forward from
+each of six disjoint interior strata. If AR is shorter than the budget, all its
+forwards are saved. This includes the beginning of thinking and the end of
+recaption, with interior coverage; it does not guarantee equal samples per phase.
+Mixed mode requires a budget of at least two. Both AR passes execute fully, so
+this approximately doubles AR work compared with one generation. Only the second
+pass runs DiT. The counting pass writes no calibration snapshots.
+
+Before DiT begins, the script verifies that the replay produced exactly the same
+text and AR forward count. A mismatch stops calibration. A counting pass without
+`</recaption>` also stops: increase `--ar-max-new-tokens` instead of calibrating on
+truncated reasoning. The AR token limit controls generation, not saved sample
+count. Neither pass changes the checkpoint's default generation config.
+
+The two existing inference-step arguments still control **only DiT**. With 8 AR
+samples and 8 DiT steps, each caption supplies at most 16 tuning samples per block.
+Equal forward counts do not mean equal token counts or a prescribed loss ratio.
+The seed is `--seed + prompt_index`, including AR sampling. The exported
+`calibration_recipe.json` records captured indices, AR counts/text, resolved AR
+sampling parameters, activation mode, and DiT schedules.
+
+AR snapshots save only the valid KV prefix, excluding unused cache capacity.
+Empty tensor markers preserve per-sample `None` masks through the collector and
+are restored before native attention executes. Only the first block stores
+hidden inputs; the AutoRound block runner propagates reference outputs through
+later blocks with their own KV snapshots. Saved forward counts are bounded; disk
+bytes still depend on context length, resolution and prompt count.
+
+### Match the intended vLLM-Omni deployment
+
+- `--ar-temperature 0` selects greedy decoding, as in Omni's base deployment YAML.
+  Omit it to retain checkpoint sampling. For stochastic AR, set all relevant
+  options explicitly, for example `--ar-temperature 0.6 --ar-top-p 0.95
+  --ar-top-k 1024`. Top-k `-1` or `0` disables the filter. The QDQ inference script
+  accepts the same three sampling options; supply them when comparing engines.
+- `--activation-mode quantized` preserves each layer's scheme: MXFP8 W8A8 and,
+  with the expert override above, MXFP4 W4A4. `--activation-mode weight-only`
+  sets activation bits to 16 in the base scheme **and all layer overrides**, so
+  actual tuning and export use W8A16/W4A16. It does not change weight bit widths.
+  Choose it only when the target runtime uses weight-only kernels for these
+  layers (for example, both Marlin paths). Mixed runtime activation policies
+  require corresponding explicit per-layer settings; do not infer the policy
+  from the checkpoint's scheme name or GPU name alone. The QDQ script also
+  supports these weight-only exports: a scoped loader compatibility adapter
+  retains all weight-format checks and disables activation QDQ for A16 layers.
+- Match `think_recaption`, `en_unified`, fixed 1024x1024 size, 8 denoising steps,
+  guidance 5.0 and AR token limit on the deployment side for the example above.
+  Equal seeds across different engines do not guarantee identical sampled text.
+
+Calibration still uses native HF text-prefix recomputation, not Omni's AR-to-DiT
+KV transfer. That optimization and runtime kernel/loader behavior need separate
+validation. These changes do not establish full 80B image quality or guarantee
+that the exported checkpoint loads correctly in every Omni/vLLM version.
 
 ## Reduce CPU memory used by calibration snapshots
 
@@ -197,8 +273,8 @@ AR text generation; `--num_inference_steps` still controls image denoising only.
 Both stages use the same loaded model and its QDQ weights. The same options
 work with `--bf16` and an original checkpoint. AR sampling keeps the checkpoint's
 generation settings and is seeded with `--seed`; align those settings separately
-when comparing with vLLM-Omni. Calibration remains direct image generation and
-does not include AR decoding. Full-model AR quality has not been validated locally.
+when comparing with vLLM-Omni. Use `--calib-mode ar-dit` when quantizing to
+include AR inputs as described above. Full-model AR quality has not been validated locally.
 The inference adapter preserves `use_cache` across Tencent's native AR kwargs
 updates for newer Transformers, which otherwise raises `KeyError: 'use_cache'`
 on the second decoding iteration. Native KV/position updates remain in use.
