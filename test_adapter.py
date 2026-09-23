@@ -347,6 +347,7 @@ def test_native_ar_text_is_passed_to_image_generation(monkeypatch, capsys, bot_t
 
     monkeypatch.setattr(model, "prepare_model_inputs", prepare, raising=False)
     monkeypatch.setattr(model, "generate", generate, raising=False)
+    monkeypatch.setattr(model, "_update_model_kwargs_for_generation", Mock(), raising=False)
     monkeypatch.setattr(model, "generate_image", MethodType(env["generate_image"], model))
     result = inference.generate_image(model, "a cute cat", bot_task=bot_task, max_new_tokens=64)
     assert result is image
@@ -361,6 +362,80 @@ def test_native_ar_text_is_passed_to_image_generation(monkeypatch, capsys, bot_t
     assert "[AR]" in capsys.readouterr().out
     assert model.generation_config.bot_task == "image"
     assert not hasattr(model.generation_config, "max_new_tokens")
+
+
+def test_native_ar_update_preserves_real_transformers_decode_loop():
+    from transformers import LlamaForCausalLM
+    from transformers.generation.utils import ALL_CACHE_NAMES
+
+    source = Path(__file__).parent / "reference/modeling_hunyuan_image_3.py"
+    tree = ast.parse(source.read_text())
+    native = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HunyuanImage3ForCausalMM")
+    method = next(
+        n for n in native.body if isinstance(n, ast.FunctionDef) and n.name == "_update_model_kwargs_for_generation"
+    )
+    env = {"ALL_CACHE_NAMES": ALL_CACHE_NAMES, "to_device": lambda tensor, device: tensor.to(device)}
+    exec(compile("from __future__ import annotations\n" + ast.unparse(method), str(source), "exec"), env)
+
+    class NativeUpdateLlama(LlamaForCausalLM):
+        _update_model_kwargs_for_generation = env["_update_model_kwargs_for_generation"]
+
+        def prepare_inputs_for_generation(
+            self, input_ids, mode=None, rope_image_info=None, tokenizer_output=None, **kwargs
+        ):
+            return super().prepare_inputs_for_generation(input_ids, **kwargs)
+
+    torch.manual_seed(42)
+    config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        eos_token_id=None,
+        pad_token_id=0,
+    )
+    model = NativeUpdateLlama(config).eval()
+    reference = LlamaForCausalLM(config).eval()
+    reference.load_state_dict(model.state_dict())
+    tokens = torch.tensor([[1, 4, 7]])
+    kwargs = dict(
+        input_ids=tokens,
+        max_new_tokens=6,
+        do_sample=False,
+        use_cache=True,
+        position_ids=torch.arange(3)[None],
+    )
+    expected = reference.generate(**kwargs)
+    original_update = model._update_model_kwargs_for_generation
+    with inference.compatible_ar_generation(model):
+        actual = model.generate(
+            **kwargs,
+            mode="gen_text",
+            rope_image_info=[],
+            tokenizer_output=SimpleNamespace(real_pos=torch.tensor([[3]])),
+        )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.shape == (1, 9)
+    assert model._update_model_kwargs_for_generation == original_update
+
+
+@pytest.mark.parametrize("mode,use_cache", [("gen_text", True), ("gen_text", False), ("gen_image", True)])
+def test_ar_compatibility_preserves_flag_and_restores_on_error(mode, use_cache):
+    original = Mock(return_value={"position_ids": torch.tensor([[4]])})
+    model = SimpleNamespace(_update_model_kwargs_for_generation=original)
+    kwargs = {"mode": mode, "use_cache": use_cache, "tokenizer_output": object()}
+    with pytest.raises(RuntimeError, match="generation failed"):
+        with inference.compatible_ar_generation(model):
+            updated = model._update_model_kwargs_for_generation(None, kwargs)
+            if mode == "gen_text":
+                assert updated["use_cache"] is use_cache
+            else:
+                assert "use_cache" not in updated
+            assert "tokenizer_output" not in updated
+            raise RuntimeError("generation failed")
+    assert model._update_model_kwargs_for_generation is original
 
 
 @pytest.mark.parametrize("calib_steps", [1, 2, 4, 8])

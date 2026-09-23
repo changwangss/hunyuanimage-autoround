@@ -199,6 +199,9 @@ work with `--bf16` and an original checkpoint. AR sampling keeps the checkpoint'
 generation settings and is seeded with `--seed`; align those settings separately
 when comparing with vLLM-Omni. Calibration remains direct image generation and
 does not include AR decoding. Full-model AR quality has not been validated locally.
+The inference adapter preserves `use_cache` across Tencent's native AR kwargs
+updates for newer Transformers, which otherwise raises `KeyError: 'use_cache'`
+on the second decoding iteration. Native KV/position updates remain in use.
 
 All packed weights must fit on the visible GPUs, with additional memory for
 temporary dequantized weights and activations. `--max-memory` accepts the same

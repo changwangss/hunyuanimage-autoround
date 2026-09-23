@@ -169,6 +169,16 @@ with the default direct-generation regression, 3 targeted tests passed in
 7.17 seconds. These checks do not execute a real AR decoding loop or establish
 full-model AR compatibility/quality. Calibration still uses direct generation.
 
+The subsequent AR `KeyError: 'use_cache'` was reproduced with the actual
+Transformers 5.12.1 decoding loop, a tiny Llama model, and Tencent's pinned native
+`_update_model_kwargs_for_generation`. The native updater drops `use_cache`
+when rebuilding kwargs; the second iteration reads it directly. The inference
+adapter now preserves this flag for `gen_text` only. Six cached decoding steps
+complete with exactly the same generated token IDs as the unmodified tiny Llama
+reference. Additional checks cover a false cache flag, unchanged diffusion
+updates, and restoring the original method after an exception. This validates
+the reported API incompatibility, not the full 80B model's AR quality.
+
 - Complete HunyuanImage 3 Instruct Distil loading, COCO image-generation
   calibration, and tuning with the actual 80B checkpoint.
 - Multi-GPU full-model calibration and its peak CPU/GPU memory requirements.

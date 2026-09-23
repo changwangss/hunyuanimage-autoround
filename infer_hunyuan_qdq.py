@@ -5,7 +5,7 @@ import argparse
 import json
 import sys
 from collections import Counter
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
@@ -153,6 +153,21 @@ def load_qdq_model(model_dir, device_map="auto", max_memory=None, **model_kwargs
     return model.eval()
 
 
+@contextmanager
+def compatible_ar_generation(model):
+    """Keep the cache flag required by newer Transformers AR decoding loops."""
+    original = model._update_model_kwargs_for_generation
+
+    def update(outputs, model_kwargs, *args, **kwargs):
+        updated = original(outputs, model_kwargs, *args, **kwargs)
+        if model_kwargs.get("mode") == "gen_text" and "use_cache" in model_kwargs:
+            updated["use_cache"] = model_kwargs["use_cache"]
+        return updated
+
+    with patch.object(model, "_update_model_kwargs_for_generation", update):
+        yield
+
+
 @torch.inference_mode()
 def generate_image(
     model,
@@ -172,7 +187,8 @@ def generate_image(
         torch.manual_seed(seed)
         config.max_new_tokens = max_new_tokens
     model_module = sys.modules[type(model).__module__]
-    with compatible_cache_initialization(model_module.HunyuanStaticCache):
+    ar_context = compatible_ar_generation(model) if bot_task != "image" else nullcontext()
+    with compatible_cache_initialization(model_module.HunyuanStaticCache), ar_context:
         cot_text, images = model.generate_image(
             prompt=prompt,
             seed=seed,
