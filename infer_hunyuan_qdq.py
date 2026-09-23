@@ -154,22 +154,38 @@ def load_qdq_model(model_dir, device_map="auto", max_memory=None, **model_kwargs
 
 
 @torch.inference_mode()
-def generate_image(model, prompt, num_inference_steps=8, guidance_scale=5.0, image_size="1024x1024", seed=42):
+def generate_image(
+    model,
+    prompt,
+    num_inference_steps=8,
+    guidance_scale=5.0,
+    image_size="1024x1024",
+    seed=42,
+    bot_task="image",
+    max_new_tokens=2048,
+):
     config = deepcopy(model.generation_config)
     config.diff_infer_steps = num_inference_steps
     config.diff_guidance_scale = guidance_scale
+    if bot_task != "image":
+        # AR sampling uses the global RNG; native seed= controls image noise.
+        torch.manual_seed(seed)
+        config.max_new_tokens = max_new_tokens
     model_module = sys.modules[type(model).__module__]
     with compatible_cache_initialization(model_module.HunyuanStaticCache):
-        _, images = model.generate_image(
+        cot_text, images = model.generate_image(
             prompt=prompt,
             seed=seed,
             image_size=image_size,
-            bot_task="image",
+            bot_task=bot_task,
             use_system_prompt="en_unified",
             generation_config=config,
+            max_new_tokens=max_new_tokens,
             use_taylor_cache=False,
             verbose=0,
         )
+    if cot_text:
+        print("[AR]", "\n".join(cot_text) if isinstance(cot_text, list) else cot_text, flush=True)
     if not images:
         raise RuntimeError("Native generation returned no images.")
     return images[0]
@@ -186,6 +202,13 @@ def main():
     parser.add_argument("--image-size", default="1024x1024")
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--bot-task",
+        choices=("image", "think", "recaption", "think_recaption"),
+        default="image",
+        help="Direct image generation, or native AR reasoning/recaptioning followed by image generation",
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum generated AR text tokens")
     parser.add_argument("--debug", action="store_true", help="Check block finiteness and save denoising/VAE statistics")
     parser.add_argument(
         "--disable-act-quant", action="store_true", help="Diagnostic: keep saved weights but bypass activation QDQ"
@@ -206,8 +229,8 @@ def main():
     if args.act_qdq != "checkpoint" and (args.bf16 or args.disable_act_quant):
         parser.error("--act-qdq rceil cannot be combined with --bf16 or --disable-act-quant")
     args.model = args.model.resolve()
-    if args.num_inference_steps < 1 or args.image_size == "auto":
-        parser.error("Use positive inference steps and a fixed image size, e.g. 1024x1024")
+    if args.num_inference_steps < 1 or args.max_new_tokens < 1 or args.image_size == "auto":
+        parser.error("Use positive inference steps/token limits and a fixed image size, e.g. 1024x1024")
     if "." in args.model.name:
         parser.error("Tencent custom code requires a model directory name without dots")
     config = json.loads((args.model / "config.json").read_text())
@@ -283,7 +306,14 @@ def main():
             )
     with diagnose_generation(model, args.output.with_suffix(".debug.json") if args.debug else None):
         image = generate_image(
-            model, args.prompt, args.num_inference_steps, args.guidance_scale, args.image_size, args.seed
+            model,
+            args.prompt,
+            args.num_inference_steps,
+            args.guidance_scale,
+            args.image_size,
+            args.seed,
+            bot_task=args.bot_task,
+            max_new_tokens=args.max_new_tokens,
         )
     if args.debug:
         from PIL import ImageStat

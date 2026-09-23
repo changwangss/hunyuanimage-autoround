@@ -189,6 +189,17 @@ using the same prompt, seed, image size, guidance and inference steps, direct
 `bot_task="image"`, `use_system_prompt="en_unified"`, and Taylor cache disabled.
 Use `--seed 43` and a different output name to inspect more samples.
 
+To run native AR reasoning and prompt rewriting before image generation, add
+`--bot-task think_recaption --max-new-tokens 2048`. Use `--bot-task recaption`
+for rewriting only, or the default `--bot-task image` for direct generation.
+The generated text is printed with an `[AR]` prefix. `--max-new-tokens` limits
+AR text generation; `--num_inference_steps` still controls image denoising only.
+Both stages use the same loaded model and its QDQ weights. The same options
+work with `--bf16` and an original checkpoint. AR sampling keeps the checkpoint's
+generation settings and is seeded with `--seed`; align those settings separately
+when comparing with vLLM-Omni. Calibration remains direct image generation and
+does not include AR decoding. Full-model AR quality has not been validated locally.
+
 All packed weights must fit on the visible GPUs, with additional memory for
 temporary dequantized weights and activations. `--max-memory` accepts the same
 GPU budgets as quantization. This is a quality-checking path and can be slow;

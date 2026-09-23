@@ -303,6 +303,66 @@ def test_qdq_generation_uses_full_inference_steps(monkeypatch, tmp_path):
     assert HunyuanStaticCache.update is original_update
 
 
+@pytest.mark.parametrize("bot_task", ["recaption", "think_recaption"])
+def test_native_ar_text_is_passed_to_image_generation(monkeypatch, capsys, bot_task):
+    from types import MethodType
+
+    source = Path(__file__).parent / "reference/modeling_hunyuan_image_3.py"
+    tree = ast.parse(source.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HunyuanImage3ForCausalMM")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "generate_image")
+    env = {
+        "torch": torch,
+        "default": lambda value, fallback: fallback if value is None else value,
+        "get_system_prompt": lambda *unused: "test system prompt",
+    }
+    exec(compile(ast.Module([method], []), str(source), "exec"), env)
+    model = TinyModel(make_config())
+    model.generation_config.use_system_prompt = "en_unified"
+    model.generation_config.bot_task = "image"
+    model.generation_config.drop_think = False
+    model._tokenizer = SimpleNamespace(
+        end_of_think_token_id=21,
+        end_of_recaption_token_id=22,
+        think_token="<think>",
+        recaption_token="<recaption>",
+        convert_tokens_to_ids=lambda token: 23,
+        decode=lambda ids: "a cat sitting on a windowsill</recaption>",
+    )
+    model.image_processor = SimpleNamespace(postprocess_outputs=Mock())
+    image = Image.new("RGB", (8, 8), "green")
+    prepared = []
+    calls = []
+
+    def prepare(**kwargs):
+        prepared.append(kwargs)
+        return dict(mode=kwargs["mode"], input_ids=torch.tensor([[10, 11]]), batch_cond_images=None)
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        if kwargs["mode"] == "gen_text":
+            assert kwargs["generation_config"].max_new_tokens == 64
+            return torch.tensor([[10, 11, 20, 22]])
+        return [image]
+
+    monkeypatch.setattr(model, "prepare_model_inputs", prepare, raising=False)
+    monkeypatch.setattr(model, "generate", generate, raising=False)
+    monkeypatch.setattr(model, "generate_image", MethodType(env["generate_image"], model))
+    result = inference.generate_image(model, "a cute cat", bot_task=bot_task, max_new_tokens=64)
+    assert result is image
+    assert [call["mode"] for call in calls] == ["gen_text", "gen_image"]
+    assert prepared[0]["max_new_tokens"] == 64
+    assert prepared[1]["prompt"] == "a cute cat"
+    assert "a cat sitting on a windowsill" in prepared[1]["cot_text"][0]
+    assert calls[1]["generation_config"].diff_infer_steps == 8
+    if bot_task == "think_recaption":
+        assert calls[0]["stage_transitions"] == [(21, [23])]
+        assert calls[0]["final_stop_tokens"] == [22]
+    assert "[AR]" in capsys.readouterr().out
+    assert model.generation_config.bot_task == "image"
+    assert not hasattr(model.generation_config, "max_new_tokens")
+
+
 @pytest.mark.parametrize("calib_steps", [1, 2, 4, 8])
 def test_native_scheduler_subset_and_meanflow(calib_steps):
     original = native_scheduler()
